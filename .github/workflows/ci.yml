@@ -1,0 +1,67 @@
+on: [push, pull_request]
+
+name: Continuous integration
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check
+        run: cargo check --all-features --workspace --bins --examples --tests
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-features --workspace --bins --examples --tests -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Test
+        run: cargo test --all-features --workspace --bins --examples --tests
+
+  readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install `cargo-sync-readme`
+        uses: actions-rs/install@v0.1
+        with:
+          crate: cargo-sync-readme
+          version: latest
+
+      - name: Is readme in sync?
+        run: cargo sync-readme -c
+
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install `typos`
+        uses: actions-rs/install@v0.1
+        with:
+          crate: typos-cli
+          version: latest
+
+      - name: Any typos?
+        run: typos
