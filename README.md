@@ -8,6 +8,15 @@
 
 Resumable FSM-based Postgres tasks
 
+
+# TODO
+- [x] retry
+- [ ] counurrency
+- [ ] logging
+- [ ] docs
+- [ ] sqlx v7
+
+
 <!-- cargo-sync-readme end -->
 
 ## Contributing

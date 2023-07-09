@@ -5,13 +5,29 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{env, time::Duration};
 
+// It wraps the task step into an enum which proxies necessary methods
+pg_fsm::task!(Count {
+    Start,
+    Proceed,
+    Finish
+});
+
+// Also we need a enum representing all the possible tasks
+pg_fsm::scheduler!(Tasks { Count });
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
+    sqlx::migrate!().run(&db).await?;
 
-    // Let's schedule a couple few tasks
-    Tasks::enqueue(&db, Start { up_to: 1 }).await?;
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    // Let's schedule a few tasks
+    Tasks::enqueue(&db, Start { up_to: 2 }).await?;
 
     // And run a worker
     pg_fsm::Worker::<Tasks>::new(db).run().await?;
@@ -19,22 +35,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pg_fsm::scheduler!(Tasks { Count });
-
-pg_fsm::task!(Count {
-    Start,
-    Proceed,
-    Finish
-});
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Start {
     pub up_to: usize,
 }
 #[async_trait]
 impl Step<Count> for Start {
-    const RETRY_DELAY: Duration = Duration::from_secs(1);
-
     async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
         println!("1..{}: start", self.up_to);
         Ok(Some(
@@ -56,7 +62,11 @@ pub struct Proceed {
 }
 #[async_trait]
 impl Step<Count> for Proceed {
+    const RETRY_LIMIT: i32 = 5;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+
     async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
+        // return Err(anyhow::anyhow!("bailing").into());
         let Self {
             up_to,
             mut cur,
@@ -86,8 +96,6 @@ pub struct Finish {
 }
 #[async_trait]
 impl Step<Count> for Finish {
-    const RETRY: usize = 5;
-
     async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
         let took = Utc::now() - self.started_at;
         let secs = num_seconds(took);

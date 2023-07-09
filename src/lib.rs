@@ -1,6 +1,15 @@
 //! # pg-fsm
 //!
 //! Resumable FSM-based Postgres tasks
+//!
+//!
+//! # TODO
+//! - [x] retry
+//! - [ ] counurrency
+//! - [ ] logging
+//! - [ ] docs
+//! - [ ] sqlx v7
+//!
 #![warn(clippy::all, missing_docs, nonstandard_style, future_incompatible)]
 
 use async_trait::async_trait;
@@ -11,6 +20,7 @@ use sqlx_error::sqlx_error;
 use std::{
     error::Error as StdError, fmt, marker::PhantomData, result::Result as StdResult, time::Duration,
 };
+use tracing::{debug, error};
 
 pub mod prelude;
 
@@ -21,11 +31,11 @@ pub enum Error {
     #[error(transparent)]
     Sqlx(#[from] sqlx_error::SqlxError),
     /// Task serialization issue - shouldn't ever happen
-    #[error("serialize task")]
-    SerializeTask(#[source] serde_json::Error),
+    #[error("serialize step")]
+    SerializeStep(#[source] serde_json::Error),
     /// Task deserialization issue - could happen if task changed while the table isn't empty
-    #[error("deserialize task")]
-    DeserializeTask(#[source] serde_json::Error),
+    #[error("deserialize step")]
+    DeserializeStep(#[source] serde_json::Error),
 }
 
 type Result<T> = StdResult<T, Error>;
@@ -42,18 +52,18 @@ where
     Task: Sized,
     Self: Into<Task> + Send + Sized + fmt::Debug,
 {
-    /// How many times retry the step on an error
-    const RETRY: usize = 0;
+    /// How many times retry_limit the step on an error
+    const RETRY_LIMIT: i32 = 0;
 
     /// The time to wait between retries
-    const RETRY_DELAY: Duration = Duration::from_secs(0);
+    const RETRY_DELAY: Duration = Duration::ZERO;
 
     /// Processes the current step and returns the next if any
     async fn step(self, db: &PgPool) -> TaskResult<Option<Task>>;
 
     /// Proxies the `RETRY` const, doesn't mean to be changed in impls
-    fn retry(&self) -> usize {
-        Self::RETRY
+    fn retry_limit(&self) -> i32 {
+        Self::RETRY_LIMIT
     }
 
     /// Proxies the `RETRY_DELAY` const, doesn't mean to be changed in impls
@@ -79,7 +89,7 @@ where
         step: S,
         delay: Duration,
     ) -> Result<Uuid> {
-        let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+        let delay = chrono_duration(delay);
         Self::schedule(db, step, Utc::now() + delay).await
     }
 
@@ -91,7 +101,7 @@ where
     ) -> Result<Uuid> {
         let task = step.into();
         let tasks: Self = task.into();
-        let step = serde_json::to_value(&tasks).map_err(Error::SerializeTask)?;
+        let step = serde_json::to_value(&tasks).map_err(Error::SerializeStep)?;
         sqlx::query!(
             "INSERT INTO fsm (step, wakeup_at) VALUES ($1, $2) RETURNING id",
             step,
@@ -111,7 +121,15 @@ pub struct Worker<T> {
     tasks: PhantomData<T>,
 }
 
-impl<T: Scheduler + Step<T>> Worker<T> {
+/// Task step with some db fields
+#[derive(Debug)]
+struct Task<S> {
+    id: Uuid,
+    step: S,
+    tried: i32,
+}
+
+impl<S: Scheduler + Step<S>> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
         Self {
@@ -131,19 +149,24 @@ impl<T: Scheduler + Step<T>> Worker<T> {
             }
 
             // TODO parallelization
-            for (id, task) in tasks {
-                self.run_task_step(id, task).await?;
+            for task in tasks {
+                self.run_step(task).await?;
             }
         }
     }
 
     /// Runs a single step of the first task in the queue
-    async fn run_task_step(&self, task_id: Uuid, task: T) -> Result<()> {
-        dbg!(task_id, &task, task.retry(), task.retry_delay());
-        match task.step(&self.db).await {
-            Err(e) => self.set_task_error(task_id, e).await?,
-            Ok(None) => self.finish_task(task_id).await?,
-            Ok(Some(step)) => self.update_task(task_id, step).await?,
+    async fn run_step(&self, task: Task<S>) -> Result<()> {
+        let Task { id, step, tried } = task;
+        let retry_limit = step.retry_limit();
+        let retry_delay = step.retry_delay();
+        match step.step(&self.db).await {
+            Err(e) => {
+                self.process_error(id, tried, retry_limit, retry_delay, e)
+                    .await?
+            }
+            Ok(None) => self.finish_task(id).await?,
+            Ok(Some(step)) => self.update_task(id, step).await?,
         };
         Ok(())
     }
@@ -158,15 +181,16 @@ impl<T: Scheduler + Step<T>> Worker<T> {
         Ok(())
     }
 
-    /// Locks the next task as running and returns it
-    async fn lock_and_fetch_tasks(&self, limit: i64) -> Result<Vec<(Uuid, T)>> {
+    /// Locks next task as running and returns it
+    async fn lock_and_fetch_tasks(&self, limit: i64) -> Result<Vec<Task<S>>> {
         let mut tx = self.db.begin().await.map_err(sqlx_error!("begin"))?;
 
         let rows = sqlx::query!(
             "
             SELECT
                 id,
-                step
+                step,
+                tried
             FROM fsm
             WHERE wakeup_at <= now()
               AND is_running = false
@@ -185,8 +209,12 @@ impl<T: Scheduler + Step<T>> Worker<T> {
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             ids.push(row.id);
-            let task: T = serde_json::from_value(row.step).map_err(Error::DeserializeTask)?;
-            tasks.push((row.id, task));
+            let step: S = serde_json::from_value(row.step).map_err(Error::DeserializeStep)?;
+            tasks.push(Task {
+                id: row.id,
+                step,
+                tried: row.tried,
+            });
         }
 
         sqlx::query!(
@@ -207,8 +235,8 @@ impl<T: Scheduler + Step<T>> Worker<T> {
     }
 
     /// Updates the tasks step
-    pub async fn update_task(&self, id: Uuid, tasks: T) -> Result<()> {
-        let step = serde_json::to_value(&tasks).map_err(Error::SerializeTask)?;
+    pub async fn update_task(&self, id: Uuid, tasks: S) -> Result<()> {
+        let step = serde_json::to_value(&tasks).map_err(Error::SerializeStep)?;
         sqlx::query!(
             "
             UPDATE fsm
@@ -237,9 +265,60 @@ impl<T: Scheduler + Step<T>> Worker<T> {
         Ok(())
     }
 
+    /// Dealing with the step error
+    async fn process_error(
+        &self,
+        task_id: Uuid,
+        tried: i32,
+        retry_limit: i32,
+        retry_delay: Duration,
+        err: TaskError,
+    ) -> Result<()> {
+        if tried < retry_limit {
+            self.retry_task(task_id, tried, retry_limit, retry_delay, err)
+                .await
+        } else {
+            self.set_task_error(task_id, tried, err).await
+        }
+    }
+
+    /// Schedules the task retry
+    pub async fn retry_task(
+        &self,
+        task_id: Uuid,
+        tried: i32,
+        retry_limit: i32,
+        delay: Duration,
+        err: TaskError,
+    ) -> Result<()> {
+        let wakeup_at = Utc::now() + chrono_duration(delay);
+        sqlx::query!(
+            "
+            UPDATE fsm
+            SET is_running = false,
+                tried = tried + 1,
+                updated_at = now(),
+                wakeup_at = $2
+            WHERE id = $1
+            ",
+            task_id,
+            wakeup_at,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(sqlx_error!())?;
+
+        debug!(
+            "{task_id} scheduled {attempt} of {retry_limit} retry in {delay:?} on error: {}",
+            source_chain::to_string(&*err),
+            attempt = tried + 1
+        );
+        Ok(())
+    }
+
     /// Sets the task error
-    pub async fn set_task_error(&self, task_id: Uuid, err: TaskError) -> Result<()> {
-        let err_str = source_chain::to_string(&*err);
+    pub async fn set_task_error(&self, task_id: Uuid, tried: i32, err: TaskError) -> Result<()> {
+        let err = source_chain::to_string(&*err);
         sqlx::query!(
             "
             UPDATE fsm
@@ -250,18 +329,22 @@ impl<T: Scheduler + Step<T>> Worker<T> {
             WHERE id = $1
             ",
             task_id,
-            err_str,
+            &err,
             Utc::now(),
         )
         .execute(&self.db)
         .await
         .map_err(sqlx_error!())?;
+        error!(
+            "{task_id} resulted in an error after {tried} attempts: {}",
+            &err
+        );
         Ok(())
     }
 }
 
-#[macro_export]
 /// Implements enum wrapper for a single task containing all it's steps
+#[macro_export]
 macro_rules! task {
     ($enum:ident { $($variant:ident),* }) => {
         #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -285,9 +368,9 @@ macro_rules! task {
                 })
             }
 
-            fn retry(&self) -> usize {
+            fn retry_limit(&self) -> i32 {
                 match self {
-                    $(Self::$variant(inner) => inner.retry(),)*
+                    $(Self::$variant(inner) => inner.retry_limit(),)*
                 }
             }
 
@@ -309,4 +392,8 @@ macro_rules! scheduler {
         #[async_trait]
         impl $crate::Scheduler for $enum {}
     }
+}
+
+fn chrono_duration(std_duration: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(std_duration).unwrap_or_else(|_| chrono::Duration::max_value())
 }
