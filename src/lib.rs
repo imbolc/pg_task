@@ -4,13 +4,15 @@
 #![warn(clippy::all, missing_docs, nonstandard_style, future_incompatible)]
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{types::Uuid, PgPool};
 use sqlx_error::sqlx_error;
 use std::{
     error::Error as StdError, fmt, marker::PhantomData, result::Result as StdResult, time::Duration,
 };
+
+pub mod prelude;
 
 /// The crate error
 #[derive(Debug, thiserror::Error)]
@@ -62,25 +64,38 @@ where
 
 /// A tait to implement on the outer enum wrapper containing all the tasks
 #[async_trait]
-pub trait TaskSet
+pub trait Scheduler
 where
     Self: fmt::Debug + DeserializeOwned + Serialize + Sized,
 {
-    /// Adds a new task to the queue
-    async fn run<S: Step<T>, T: Into<Self> + Send>(db: &PgPool, step: S) -> Result<Uuid> {
-        dbg!(&step, step.retry(), step.retry_delay());
+    /// Enqueues the task to be run immediately
+    async fn enqueue<S: Step<T>, T: Into<Self> + Send>(db: &PgPool, step: S) -> Result<Uuid> {
+        Self::schedule(db, step, Utc::now()).await
+    }
+
+    /// Schedules a task to be run after a specified delay
+    async fn delay<S: Step<T>, T: Into<Self> + Send>(
+        db: &PgPool,
+        step: S,
+        delay: Duration,
+    ) -> Result<Uuid> {
+        let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+        Self::schedule(db, step, Utc::now() + delay).await
+    }
+
+    /// Schedules a task to run at a specified time in the future
+    async fn schedule<S: Step<T>, T: Into<Self> + Send>(
+        db: &PgPool,
+        step: S,
+        at: DateTime<Utc>,
+    ) -> Result<Uuid> {
         let task = step.into();
         let tasks: Self = task.into();
         let step = serde_json::to_value(&tasks).map_err(Error::SerializeTask)?;
-        let now = Utc::now();
         sqlx::query!(
-            "
-            INSERT INTO fsm (id, tried, is_running, step,  wakeup_at, created_at, updated_at)
-            VALUES (gen_random_uuid(),    0,      false,   $1,         $2,         $2,         $2)
-            RETURNING id
-            ",
+            "INSERT INTO fsm (step, wakeup_at) VALUES ($1, $2) RETURNING id",
             step,
-            now,
+            at
         )
         .map(|r| r.id)
         .fetch_one(db)
@@ -96,7 +111,7 @@ pub struct Worker<T> {
     tasks: PhantomData<T>,
 }
 
-impl<T: TaskSet + Step<T>> Worker<T> {
+impl<T: Scheduler + Step<T>> Worker<T> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
         Self {
@@ -151,7 +166,6 @@ impl<T: TaskSet + Step<T>> Worker<T> {
             "
             SELECT
                 id,
-                -- tried,
                 step
             FROM fsm
             WHERE wakeup_at <= now()
@@ -172,7 +186,6 @@ impl<T: TaskSet + Step<T>> Worker<T> {
         for row in rows {
             ids.push(row.id);
             let task: T = serde_json::from_value(row.step).map_err(Error::DeserializeTask)?;
-            // let retry = row.tried < task.RETRY;
             tasks.push((row.id, task));
         }
 
@@ -249,7 +262,7 @@ impl<T: TaskSet + Step<T>> Worker<T> {
 
 #[macro_export]
 /// Implements enum wrapper for a single task containing all it's steps
-macro_rules! pg_task {
+macro_rules! task {
     ($enum:ident { $($variant:ident),* }) => {
         #[derive(Debug, serde::Deserialize, serde::Serialize)]
         pub enum $enum {
@@ -265,8 +278,8 @@ macro_rules! pg_task {
         )*
 
         #[async_trait::async_trait]
-        impl Step<$enum> for $enum {
-            async fn step(self, db: &sqlx::PgPool) -> TaskResult<Option<$enum>> {
+        impl $crate::Step<$enum> for $enum {
+            async fn step(self, db: &sqlx::PgPool) -> $crate::TaskResult<Option<$enum>> {
                 Ok(match self {
                     $(Self::$variant(inner) => inner.step(db).await?.map(Into::into),)*
                 })
@@ -289,11 +302,11 @@ macro_rules! pg_task {
 
 /// The macro implements the outer enum wrapper containing all the tasks
 #[macro_export]
-macro_rules! pg_task_runner {
+macro_rules! scheduler {
     ($enum:ident { $($variant:ident),* }) => {
-        $crate::pg_task!($enum { $($variant),* });
+        $crate::task!($enum { $($variant),* });
 
         #[async_trait]
-        impl TaskSet for $enum {}
+        impl $crate::Scheduler for $enum {}
     }
 }

@@ -2,7 +2,7 @@ CREATE TABLE fsm (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     step JSONB NOT NULL,
     wakeup_at timestamptz NOT NULL DEFAULT now(),
-    tried INT NOT NULL DEFAULT 0 CHECK(tried > 0),
+    tried INT NOT NULL DEFAULT 0 CHECK(tried >= 0),
     is_running BOOLEAN NOT NULL DEFAULT false,
     error TEXT,
     created_at timestamptz NOT NULL DEFAULT now(),
