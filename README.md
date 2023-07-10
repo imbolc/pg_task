@@ -11,8 +11,9 @@ Resumable FSM-based Postgres tasks
 
 # TODO
 - [x] retry
-- [ ] counurrency
+- [ ] log worker errors
 - [ ] logging
+- [ ] counurrency
 - [ ] docs
 - [ ] sqlx v7
 

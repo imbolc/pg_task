@@ -41,7 +41,7 @@ pub struct Start {
 }
 #[async_trait]
 impl Step<Count> for Start {
-    async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
         println!("1..{}: start", self.up_to);
         Ok(Some(
             Proceed {
@@ -65,7 +65,7 @@ impl Step<Count> for Proceed {
     const RETRY_LIMIT: i32 = 5;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
         // return Err(anyhow::anyhow!("bailing").into());
         let Self {
             up_to,
@@ -96,7 +96,7 @@ pub struct Finish {
 }
 #[async_trait]
 impl Step<Count> for Finish {
-    async fn step(self, _db: &PgPool) -> TaskResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
         let took = Utc::now() - self.started_at;
         let secs = num_seconds(took);
         let per_sec = self.up_to as f64 / secs;
