@@ -1,4 +1,4 @@
-use crate::{utils::chrono_duration, Error, Result, Scheduler, Step, StepError};
+use crate::{Error, Result, Step, StepError};
 use chrono::Utc;
 use sqlx::{types::Uuid, PgPool};
 use sqlx_error::sqlx_error;
@@ -18,7 +18,7 @@ struct Task<S> {
     tried: i32,
 }
 
-impl<S: Scheduler + Step<S>> Worker<S> {
+impl<S: Step<S>> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
         Self {
@@ -180,7 +180,9 @@ impl<S: Scheduler + Step<S>> Worker<S> {
         delay: Duration,
         err: StepError,
     ) -> Result<()> {
-        let wakeup_at = Utc::now() + chrono_duration(delay);
+        let delay =
+            chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::max_value());
+        let wakeup_at = Utc::now() + delay;
         sqlx::query!(
             "
             UPDATE fsm

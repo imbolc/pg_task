@@ -15,9 +15,11 @@ pub enum Error {
     DeserializeStep(#[source] serde_json::Error),
 }
 
-pub(crate) type Result<T> = StdResult<T, Error>;
+/// The crate result
+pub type Result<T> = StdResult<T, Error>;
 
 /// Error of a task step
 pub type StepError = Box<dyn StdError + 'static>;
+
 /// Result returning from task steps
 pub type StepResult<T> = StdResult<T, StepError>;
