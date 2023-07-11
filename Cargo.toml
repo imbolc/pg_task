@@ -4,7 +4,7 @@ edition = "2021"
 license = "MIT"
 name = "pg_task"
 repository = "https://github.com/imbolc/pg_task"
-version = "0.0.2"
+version = "0.0.3"
 
 [dependencies]
 async-trait = "0.1"
@@ -15,6 +15,7 @@ source-chain = "0.1"
 sqlx = { version = "0.6", features = [
   "json",
   "chrono",
+  "offline",
   "postgres",
   "runtime-tokio-rustls",
   "uuid",
