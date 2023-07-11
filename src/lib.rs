@@ -4,8 +4,7 @@
 //!
 //! # TODO
 //! - [x] retry
-//! - `pg_task::enqueue(Tasks::Count(Start { .. }.into()))` - bring back Scheduler trait
-//! - [ ] log worker errors
+//! - [ ] log worker errors instead of crashing
 //! - [ ] logging
 //! - [ ] counurrency
 //! - [ ] docs
@@ -19,10 +18,24 @@ mod traits;
 mod worker;
 
 pub use error::{Error, Result, StepError, StepResult};
-pub use traits::Step;
+pub use traits::{Scheduler, Step};
 pub use worker::Worker;
 
-pub use chrono;
-pub use sqlx::{types::Uuid, PgPool};
-//TODO
-pub use sqlx_error::sqlx_error;
+use chrono::{DateTime, Utc};
+use sqlx::{types::Uuid, PgPool};
+use std::time::Duration;
+
+/// Enqueues the task to be run immediately
+pub async fn enqueue(db: &PgPool, task: &impl Scheduler) -> Result<Uuid> {
+    task.enqueue(db).await
+}
+
+/// Schedules a task to be run after a specified delay
+pub async fn delay(db: &PgPool, task: &impl Scheduler, delay: Duration) -> Result<Uuid> {
+    task.delay(db, delay).await
+}
+
+/// Schedules a task to run at a specified time in the future
+pub async fn schedule(db: &PgPool, task: &impl Scheduler, at: DateTime<Utc>) -> Result<Uuid> {
+    task.schedule(db, at).await
+}

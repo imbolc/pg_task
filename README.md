@@ -10,8 +10,7 @@ Resumable state machine based Postgres tasks
 
 # TODO
 - [x] retry
-- `pg_task::enqueue(Tasks::Count(Start { .. }.into()))` - bring back Scheduler trait
-- [ ] log worker errors
+- [ ] log worker errors instead of crashing
 - [ ] logging
 - [ ] counurrency
 - [ ] docs
