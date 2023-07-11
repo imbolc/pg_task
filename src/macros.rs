@@ -69,7 +69,7 @@ macro_rules! scheduler {
             ) -> $crate::Result<$crate::Uuid> {
                 let step = serde_json::to_value(self).map_err($crate::Error::SerializeStep)?;
                 sqlx::query!(
-                    "INSERT INTO fsm (step, wakeup_at) VALUES ($1, $2) RETURNING id",
+                    "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2) RETURNING id",
                     step,
                     at
                 )

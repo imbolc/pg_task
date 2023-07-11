@@ -1,19 +1,19 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pg_fsm::{Step, StepResult};
+use pg_task::{Step, StepResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{env, time::Duration};
 
 // It wraps the task step into an enum which proxies necessary methods
-pg_fsm::task!(Count {
+pg_task::task!(Count {
     Start,
     Proceed,
     Finish
 });
 
 // Also we need a enum representing all the possible tasks
-pg_fsm::scheduler!(Tasks { Count });
+pg_task::scheduler!(Tasks { Count });
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     Tasks::Count(Start { up_to: 2 }.into()).enqueue(&db).await?;
 
     // And run a worker
-    pg_fsm::Worker::<Tasks>::new(db).run().await?;
+    pg_task::Worker::<Tasks>::new(db).run().await?;
 
     Ok(())
 }

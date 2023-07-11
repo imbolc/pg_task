@@ -1,10 +1,10 @@
-//! # pg-fsm
+//! # pg_task
 //!
-//! Resumable FSM-based Postgres tasks
-//!
+//! Resumable state machine based Postgres tasks
 //!
 //! # TODO
 //! - [x] retry
+//! - `pg_task::enqueue(Tasks::Count(Start { .. }.into()))` - bring back Scheduler trait
 //! - [ ] log worker errors
 //! - [ ] logging
 //! - [ ] counurrency

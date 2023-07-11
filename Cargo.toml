@@ -1,10 +1,10 @@
 [package]
-description = "Resumable FSM-based Postgres tasks"
+description = "Resumable state machine based Postgres tasks"
 edition = "2021"
 license = "MIT"
-name = "pg-fsm"
-repository = "https://github.com/imbolc/pg-fsm"
-version = "0.1.0"
+name = "pg_task"
+repository = "https://github.com/imbolc/pg_task"
+version = "0.0.1"
 
 [dependencies]
 async-trait = "0.1"

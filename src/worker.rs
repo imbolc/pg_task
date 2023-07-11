@@ -63,7 +63,7 @@ impl<S: Step<S>> Worker<S> {
     /// Unlocks all tasks. It meant to run at the worker start as some tasks could stuck locked forever
     /// if the previous run ended up with some kind of a crush.
     pub async fn unlock_all_tasks(&self) -> Result<()> {
-        sqlx::query!("UPDATE fsm SET is_running = false")
+        sqlx::query!("UPDATE pg_task SET is_running = false")
             .execute(&self.db)
             .await
             .map_err(sqlx_error!())?;
@@ -80,7 +80,7 @@ impl<S: Step<S>> Worker<S> {
                 id,
                 step,
                 tried
-            FROM fsm
+            FROM pg_task
             WHERE wakeup_at <= now()
               AND is_running = false
               AND error IS NULL
@@ -108,7 +108,7 @@ impl<S: Step<S>> Worker<S> {
 
         sqlx::query!(
             "
-            UPDATE fsm
+            UPDATE pg_task
             SET is_running = true,
                 updated_at = now()
             WHERE id = any($1)
@@ -128,7 +128,7 @@ impl<S: Step<S>> Worker<S> {
         let step = serde_json::to_value(&tasks).map_err(Error::SerializeStep)?;
         sqlx::query!(
             "
-            UPDATE fsm
+            UPDATE pg_task
             SET is_running = false,
                 step = $2,
                 updated_at = $3,
@@ -147,7 +147,7 @@ impl<S: Step<S>> Worker<S> {
 
     /// Removes a finished task
     pub async fn finish_task(&self, task_id: Uuid) -> Result<()> {
-        sqlx::query!("DELETE FROM fsm WHERE id = $1", task_id)
+        sqlx::query!("DELETE FROM pg_task WHERE id = $1", task_id)
             .execute(&self.db)
             .await
             .map_err(sqlx_error!())?;
@@ -185,7 +185,7 @@ impl<S: Step<S>> Worker<S> {
         let wakeup_at = Utc::now() + delay;
         sqlx::query!(
             "
-            UPDATE fsm
+            UPDATE pg_task
             SET is_running = false,
                 tried = tried + 1,
                 updated_at = now(),
@@ -212,7 +212,7 @@ impl<S: Step<S>> Worker<S> {
         let err = source_chain::to_string(&*err);
         sqlx::query!(
             "
-            UPDATE fsm
+            UPDATE pg_task
             SET is_running = false,
                 error = $2,
                 updated_at = $3,

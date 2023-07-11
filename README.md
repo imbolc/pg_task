@@ -1,16 +1,16 @@
-[![License](https://img.shields.io/crates/l/pg-fsm.svg)](https://choosealicense.com/licenses/mit/)
-[![Crates.io](https://img.shields.io/crates/v/pg-fsm.svg)](https://crates.io/crates/pg-fsm)
-[![Docs.rs](https://docs.rs/pg-fsm/badge.svg)](https://docs.rs/pg-fsm)
+[![License](https://img.shields.io/crates/l/pg_task.svg)](https://choosealicense.com/licenses/mit/)
+[![Crates.io](https://img.shields.io/crates/v/pg_task.svg)](https://crates.io/crates/pg_task)
+[![Docs.rs](https://docs.rs/pg_task/badge.svg)](https://docs.rs/pg_task)
 
 <!-- cargo-sync-readme start -->
 
-# pg-fsm
+# pg_task
 
-Resumable FSM-based Postgres tasks
-
+Resumable state machine based Postgres tasks
 
 # TODO
 - [x] retry
+- `pg_task::enqueue(Tasks::Count(Start { .. }.into()))` - bring back Scheduler trait
 - [ ] log worker errors
 - [ ] logging
 - [ ] counurrency

@@ -1,4 +1,4 @@
-CREATE TABLE fsm (
+CREATE TABLE pg_task (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     step JSONB NOT NULL,
     wakeup_at timestamptz NOT NULL DEFAULT now(),
@@ -9,13 +9,13 @@ CREATE TABLE fsm (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX fsm_wakeup_at_idx ON fsm (wakeup_at);
+CREATE INDEX pg_task_wakeup_at_idx ON pg_task (wakeup_at);
 
-COMMENT ON TABLE fsm IS 'pg_fsm tasks';
-COMMENT ON COLUMN fsm.step IS 'State of the current step';
-COMMENT ON COLUMN fsm.wakeup_at IS 'Scheduled time for the task to execute the current step';
-COMMENT ON COLUMN fsm.tried IS 'Number of times the current step has resulted in an error';
-COMMENT ON COLUMN fsm.is_running IS 'Indicates if the current step is running right now';
-COMMENT ON COLUMN fsm.error IS 'Indicates if the current step has resulted in an error and all retry attempts have been exhausted. Set this field to null for the step to resume.';
-COMMENT ON COLUMN fsm.created_at IS 'Time the task was created';
-COMMENT ON COLUMN fsm.updated_at IS 'Time the task was updated';
+COMMENT ON TABLE pg_task IS 'pg_task tasks';
+COMMENT ON COLUMN pg_task.step IS 'State of the current step';
+COMMENT ON COLUMN pg_task.wakeup_at IS 'Scheduled time for the task to execute the current step';
+COMMENT ON COLUMN pg_task.tried IS 'Number of times the current step has resulted in an error';
+COMMENT ON COLUMN pg_task.is_running IS 'Indicates if the current step is running right now';
+COMMENT ON COLUMN pg_task.error IS 'Indicates if the current step has resulted in an error and all retry attempts have been exhausted. Set this field to null for the step to resume.';
+COMMENT ON COLUMN pg_task.created_at IS 'Time the task was created';
+COMMENT ON COLUMN pg_task.updated_at IS 'Time the task was updated';
