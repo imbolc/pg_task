@@ -6,36 +6,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_PASSWORD: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
-    env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost/postgres
-
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           components: rustfmt, clippy
-
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli
-
-      - name: Setup Database
-        run: |
-          sqlx database create
-          sqlx migrate run
 
       - name: Format
         run: cargo fmt -- --check
