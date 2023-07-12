@@ -21,10 +21,10 @@ async fn main() -> anyhow::Result<()> {
     init_logging()?;
 
     // Let's schedule a few tasks
-    pg_task::enqueue(&db, &Tasks::Count(Start { up_to: 2 }.into())).await?;
+    // pg_task::enqueue(&db, &Tasks::Count(Start { up_to: 2 }.into())).await?;
 
     // And run a worker
-    pg_task::Worker::<Tasks>::new(db).run().await?;
+    pg_task::Worker::<Tasks>::new(db).run().await;
 
     Ok(())
 }
