@@ -35,10 +35,28 @@
     },
     "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                step = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            "
   },
-  "2852285058c4d62112e945c12d12d7a25eb9e6d418a84698bbfcfd2ef7bcb824": {
+  "24d7ef3a1dc86b9e408c7c691cb9c981673f0139ec30884dead832f19bae36d9": {
     "describe": {
       "columns": [],
       "nullable": [],
+      "parameters": {
+        "Left": []
+      }
+    },
+    "query": "UPDATE pg_task SET is_running = false WHERE is_running = true"
+  },
+  "50272f3163379639e7a56ddb7ceeed0573d31618344cf8fbe372493bc3ce972b": {
+    "describe": {
+      "columns": [
+        {
+          "name": "tried",
+          "ordinal": 0,
+          "type_info": "Int4"
+        }
+      ],
+      "nullable": [
+        false
+      ],
       "parameters": {
         "Left": [
           "Uuid",
@@ -47,7 +65,7 @@
         ]
       }
     },
-    "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            "
+    "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            RETURNING tried\n            "
   },
   "608df75004a94caa1aa03a2706ccde0b99950a53529501f3218fefdea2501347": {
     "describe": {
@@ -60,16 +78,6 @@
       }
     },
     "query": "\n            UPDATE pg_task\n            SET is_running = true,\n                updated_at = now()\n            WHERE id = any($1)\n            "
-  },
-  "af4114bf721284e058b091081aa3d4d910a4d06c5f855395400dc89eb5ea10f2": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Left": []
-      }
-    },
-    "query": "UPDATE pg_task SET is_running = false"
   },
   "bb841cee526de5c880788fa8ecf688b7a06bd9fd7bdef3458300d70a6814ab5f": {
     "describe": {
