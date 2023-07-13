@@ -4,15 +4,12 @@ use tracing::error;
 /// The crate error
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Sqlx error with some context
-    #[error(transparent)]
-    Sqlx(#[from] sqlx_error::SqlxError),
-    /// Task serialization issue - shouldn't ever happen
+    /// Db error during task saving
+    #[error("add task")]
+    AddTask(#[source] sqlx::Error),
+    /// Task serialization issue
     #[error("serialize step")]
     SerializeStep(#[source] serde_json::Error),
-    /// Task deserialization issue - could happen if task changed while the table isn't empty
-    #[error("deserialize step")]
-    DeserializeStep(#[source] serde_json::Error),
 }
 
 /// The crate result

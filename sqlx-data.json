@@ -31,28 +31,6 @@
     },
     "query": "UPDATE pg_task SET is_running = false WHERE is_running = true"
   },
-  "50272f3163379639e7a56ddb7ceeed0573d31618344cf8fbe372493bc3ce972b": {
-    "describe": {
-      "columns": [
-        {
-          "name": "tried",
-          "ordinal": 0,
-          "type_info": "Int4"
-        }
-      ],
-      "nullable": [
-        false
-      ],
-      "parameters": {
-        "Left": [
-          "Uuid",
-          "Text",
-          "Timestamptz"
-        ]
-      }
-    },
-    "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            RETURNING tried\n            "
-  },
   "608df75004a94caa1aa03a2706ccde0b99950a53529501f3218fefdea2501347": {
     "describe": {
       "columns": [],
@@ -123,6 +101,34 @@
       }
     },
     "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                tried = tried + 1,\n                updated_at = now(),\n                wakeup_at = $2\n            WHERE id = $1\n            "
+  },
+  "ca5cb904ec5a18ac71e0b7ee2fe0cd98f16a252cb4774ebbec842f267eea6fe6": {
+    "describe": {
+      "columns": [
+        {
+          "name": "tried",
+          "ordinal": 0,
+          "type_info": "Int4"
+        },
+        {
+          "name": "step!",
+          "ordinal": 1,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        null
+      ],
+      "parameters": {
+        "Left": [
+          "Uuid",
+          "Text",
+          "Timestamptz"
+        ]
+      }
+    },
+    "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            RETURNING tried, step::TEXT as \"step!\"\n            "
   },
   "ebc5a43458570f6f64356d4fdffb906b7b52ff09a55a3064ed7943558234b103": {
     "describe": {

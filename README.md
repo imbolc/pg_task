@@ -10,8 +10,8 @@ Resumable state machine based Postgres tasks
 
 # TODO
 - [x] retry
-- [ ] log worker errors instead of crashing
-- [ ] logging
+- [x] log worker errors instead of crashing
+- [x] logging
 - [ ] counurrency
 - [ ] docs
 - [ ] sqlx v7

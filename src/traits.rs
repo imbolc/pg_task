@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{types::Uuid, PgPool};
-use sqlx_error::sqlx_error;
 use std::{fmt, time::Duration};
 
 /// A tait to implement on each task step
@@ -59,7 +58,6 @@ pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
         .map(|r| r.id)
         .fetch_one(db)
         .await
-        .map_err(sqlx_error!(format!("add task {:?}", self)))
-        .map_err(Into::into)
+        .map_err(Error::AddTask)
     }
 }

@@ -16,7 +16,7 @@ enum ErrorReport {
     #[error("serialize step: {1}")]
     SerializeStep(#[source] serde_json::Error, String),
     /// Task deserialization issue - could happen if task changed while the table isn't empty
-    #[error("deserialize step: {1}")]
+    #[error("can't deserialize step `{1}` (tasks code has probably been changed after scheduling this step)")]
     DeserializeStep(#[source] serde_json::Error, String),
 }
 
@@ -86,12 +86,13 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Runs a single step of the first task in the queue
+    // #[tracing::instrument(skip(self))]
     async fn run_step(&self, task: Task<S>) -> Result<()> {
         let Task { id, step, tried } = task;
         let retry_limit = step.retry_limit();
         let retry_delay = step.retry_delay();
         debug!(
-            "{id} {attempt} of {max_attempts} to run step {step:?}",
+            "[{id}] {attempt} of {max_attempts} attempt to run step {step:?}",
             attempt = tried + 1,
             max_attempts = retry_limit + 1
         );
@@ -148,7 +149,23 @@ impl<S: Step<S>> Worker<S> {
         .fetch_all(&mut tx)
         .await
         .map_err(sqlx_error!("select"))?;
-        let mut ids = Vec::with_capacity(rows.len());
+
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        sqlx::query!(
+            "
+            UPDATE pg_task
+            SET is_running = true,
+                updated_at = now()
+            WHERE id = any($1)
+            ",
+            &ids
+        )
+        .execute(&mut tx)
+        .await
+        .map_err(sqlx_error!("lock"))?;
+
+        tx.commit().await.map_err(sqlx_error!("commit"))?;
+
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             let step: S = match serde_json::from_value(row.step)
@@ -169,42 +186,26 @@ impl<S: Step<S>> Worker<S> {
                 step,
                 tried: row.tried,
             });
-            ids.push(row.id);
         }
-
-        sqlx::query!(
-            "
-            UPDATE pg_task
-            SET is_running = true,
-                updated_at = now()
-            WHERE id = any($1)
-            ",
-            &ids
-        )
-        .execute(&mut tx)
-        .await
-        .map_err(sqlx_error!("lock"))?;
-
-        tx.commit().await.map_err(sqlx_error!("commit"))?;
 
         if tasks.is_empty() {
             trace!("No ready to run tasks found");
         } else {
-            debug!("Found {} ready to run tasks", tasks.len());
+            debug!("Found tasks ready to run: {}", tasks.len());
         }
         Ok(tasks)
     }
 
     /// Updates the tasks step
-    async fn update_task_step(&self, id: Uuid, step: S) -> Result<()> {
-        trace!("{id} update step to {step:?}");
+    async fn update_task_step(&self, task_id: Uuid, step: S) -> Result<()> {
+        trace!("[{task_id}] update step to {step:?}");
 
         let step = match serde_json::to_value(&step)
             .map_err(|e| ErrorReport::SerializeStep(e, format!("{:?}", step)))
         {
             Ok(x) => x,
             Err(e) => {
-                self.set_task_error(id, e.into())
+                self.set_task_error(task_id, e.into())
                     .await
                     .map_err(ErrorReport::log)
                     .ok();
@@ -222,19 +223,21 @@ impl<S: Step<S>> Worker<S> {
                 wakeup_at = $3
             WHERE id = $1
             ",
-            id,
+            task_id,
             step,
             Utc::now(),
         )
         .execute(&self.db)
         .await
         .map_err(sqlx_error!())?;
+
+        debug!("[{task_id}] step is done");
         Ok(())
     }
 
     /// Removes the finished task
     async fn finish_task(&self, task_id: Uuid) -> Result<()> {
-        debug!("{task_id} is done");
+        debug!("[{task_id}] is successfully completed");
         sqlx::query!("DELETE FROM pg_task WHERE id = $1", task_id)
             .execute(&self.db)
             .await
@@ -268,7 +271,7 @@ impl<S: Step<S>> Worker<S> {
         delay: Duration,
         err: StepError,
     ) -> Result<()> {
-        trace!("{task_id} scheduling retry");
+        trace!("[{task_id}] scheduling retry");
 
         let delay =
             chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::max_value());
@@ -290,7 +293,7 @@ impl<S: Step<S>> Worker<S> {
         .map_err(sqlx_error!())?;
 
         debug!(
-            "{task_id} scheduled {attempt} of {retry_limit} retry in {delay:?} on error: {}",
+            "[{task_id}] scheduled {attempt} of {retry_limit} retry in {delay:?} on error: {}",
             source_chain::to_string(&*err),
             attempt = tried + 1
         );
@@ -299,29 +302,29 @@ impl<S: Step<S>> Worker<S> {
 
     /// Sets the task error
     async fn set_task_error(&self, task_id: Uuid, err: StepError) -> Result<()> {
-        trace!("{task_id} saving error");
+        trace!("[{task_id}] saving error");
 
         let err = source_chain::to_string(&*err);
-        let tried = sqlx::query!(
-            "
+        let (tried, step) = sqlx::query!(
+            r#"
             UPDATE pg_task
             SET is_running = false,
                 error = $2,
                 updated_at = $3,
                 wakeup_at = $3
             WHERE id = $1
-            RETURNING tried
-            ",
+            RETURNING tried, step::TEXT as "step!"
+            "#,
             task_id,
             &err,
             Utc::now(),
         )
         .fetch_one(&self.db)
         .await
-        .map_err(sqlx_error!())?
-        .tried;
+        .map(|r| (r.tried, r.step))
+        .map_err(sqlx_error!())?;
         error!(
-            "{task_id} resulted in an error after {tried} attempts: {}",
+            "[{task_id}] resulted in an error on step {step} after {tried} attempts: {}",
             &err
         );
         Ok(())

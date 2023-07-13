@@ -9,7 +9,7 @@ pre-commit = """\
 """
 pre-push = """\
     cargo sqlx prepare --check \
-    cargo sync-readme -c \
+    && cargo sync-readme -c \
 """
 
 [logging]
