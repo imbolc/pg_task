@@ -16,7 +16,7 @@ where
     const RETRY_LIMIT: i32 = 0;
 
     /// The time to wait between retries
-    const RETRY_DELAY: Duration = Duration::ZERO;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
 
     /// Processes the current step and returns the next if any
     async fn step(self, db: &PgPool) -> StepResult<Option<Task>>;
@@ -49,7 +49,7 @@ pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
 
     /// Schedules a task to run at a specified time in the future
     async fn schedule(&self, db: &PgPool, at: DateTime<Utc>) -> Result<Uuid> {
-        let step = serde_json::to_value(self).map_err(Error::SerializeStep)?;
+        let step = serde_json::to_string(self).map_err(Error::SerializeStep)?;
         sqlx::query!(
             "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2) RETURNING id",
             step,

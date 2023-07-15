@@ -1,6 +1,6 @@
 CREATE TABLE pg_task (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    step JSONB NOT NULL,
+    step TEXT NOT NULL,
     wakeup_at timestamptz NOT NULL DEFAULT now(),
     tried INT NOT NULL DEFAULT 0,
     is_running BOOLEAN NOT NULL DEFAULT false,
