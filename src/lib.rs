@@ -1,12 +1,6 @@
 //! # pg_task
 //!
 //! Resumable state machine based Postgres tasks
-//!
-//! # TODO
-//! - [ ] counurrency
-//! - [ ] docs
-//! - [ ] sqlx v7
-//!
 #![warn(clippy::all, missing_docs, nonstandard_style, future_incompatible)]
 
 mod error;

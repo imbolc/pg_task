@@ -8,12 +8,6 @@
 
 Resumable state machine based Postgres tasks
 
-# TODO
-- [ ] counurrency
-- [ ] docs
-- [ ] sqlx v7
-
-
 <!-- cargo-sync-readme end -->
 
 ## Contributing
