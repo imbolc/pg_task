@@ -3,7 +3,7 @@ pre-commit = """\
     cargo fmt -- --check \
     && cargo test --all-features --workspace --bins --examples --tests \
     && cargo clippy --all-features --workspace --bins --examples --tests -- -D warnings \
-    && cargo sqlx prepare && git add sqlx-data.json \
+    && cargo sqlx prepare && git add .sqlx \
     && cargo sync-readme && git add README.md \
     && typos \
 """

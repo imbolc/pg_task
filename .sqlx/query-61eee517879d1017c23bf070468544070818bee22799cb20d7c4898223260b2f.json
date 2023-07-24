@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                tried = 0,\n                step = $2,\n                updated_at = $3,\n                wakeup_at = $3\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "61eee517879d1017c23bf070468544070818bee22799cb20d7c4898223260b2f"
+}
