@@ -2,9 +2,8 @@ use crate::{Step, StepError};
 use chrono::{DateTime, Utc};
 use code_path::code_path;
 use sqlx::{
-    postgres::PgListener,
-    Postgres,
-    {types::Uuid, PgPool},
+    postgres::{PgConnection, PgListener, PgPool},
+    types::Uuid,
 };
 use std::{marker::PhantomData, time::Duration};
 use tokio::time::{sleep, timeout};
@@ -29,7 +28,6 @@ enum ErrorReport {
 }
 
 type Result<T> = std::result::Result<T, ErrorReport>;
-pub type PgTransaction<'a> = sqlx::Transaction<'a, Postgres>;
 
 macro_rules! sqlx_error {
     () => {
@@ -317,7 +315,7 @@ impl<S: Step<S>> Worker<S> {
 }
 
 /// Fetches the closest task to run
-async fn fetch_closest_task(tx: &mut PgTransaction<'_>) -> Result<Option<Task>> {
+async fn fetch_closest_task(con: &mut PgConnection) -> Result<Option<Task>> {
     trace!("Fetching the closest task to run");
     let task = sqlx::query_as!(
         Task,
@@ -335,7 +333,7 @@ async fn fetch_closest_task(tx: &mut PgTransaction<'_>) -> Result<Option<Task>> 
         FOR UPDATE
         "#,
     )
-    .fetch_optional(tx)
+    .fetch_optional(con)
     .await
     .map_err(sqlx_error!("select"))?;
 
@@ -352,7 +350,7 @@ async fn fetch_closest_task(tx: &mut PgTransaction<'_>) -> Result<Option<Task>> 
     Ok(task)
 }
 
-async fn mark_task_running(tx: &mut PgTransaction<'_>, task_id: Uuid) -> Result<()> {
+async fn mark_task_running(con: &mut PgConnection, task_id: Uuid) -> Result<()> {
     sqlx::query!(
         "
         UPDATE pg_task
@@ -362,7 +360,7 @@ async fn mark_task_running(tx: &mut PgTransaction<'_>, task_id: Uuid) -> Result<
         ",
         task_id
     )
-    .execute(tx)
+    .execute(con)
     .await
     .map_err(sqlx_error!())?;
     Ok(())

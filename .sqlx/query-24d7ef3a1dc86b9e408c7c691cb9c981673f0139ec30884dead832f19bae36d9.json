@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pg_task SET is_running = false WHERE is_running = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "24d7ef3a1dc86b9e408c7c691cb9c981673f0139ec30884dead832f19bae36d9"
+}
