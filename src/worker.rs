@@ -88,10 +88,9 @@ impl<S: Step<S>> Worker<S> {
 
         // TODO concurrency
         loop {
-            let Ok(task) = self.recv_task().await.map_err(ErrorReport::log)
-            else {
+            let Ok(task) = self.recv_task().await.map_err(ErrorReport::log) else {
                 sleep(Duration::from_secs(1)).await;
-                continue
+                continue;
             };
             self.run_step(task).await.map_err(ErrorReport::log).ok();
         }
@@ -103,10 +102,13 @@ impl<S: Step<S>> Worker<S> {
             id, step, tried, ..
         } = task;
         info!(
-            "[{id}] {attempt} attempt to run step {step:?}",
-            attempt = ordinal(tried + 1),
+            "[{id}]{} run step {step}",
+            if tried > 0 {
+                format!(" {} attempt to", ordinal(tried + 1))
+            } else {
+                "".into()
+            },
         );
-
         let step: S = match serde_json::from_str(&step)
             .map_err(|e| ErrorReport::DeserializeStep(e, format!("{:?}", step)))
         {
@@ -181,8 +183,6 @@ impl<S: Step<S>> Worker<S> {
 
     /// Updates the tasks step
     async fn update_task_step(&self, task_id: Uuid, step: S) -> Result<()> {
-        trace!("[{task_id}] update step to {step:?}");
-
         let step = match serde_json::to_string(&step)
             .map_err(|e| ErrorReport::SerializeStep(e, format!("{:?}", step)))
         {
@@ -195,6 +195,7 @@ impl<S: Step<S>> Worker<S> {
                 return Ok(());
             }
         };
+        trace!("[{task_id}] update step to {step}");
 
         sqlx::query!(
             "
@@ -412,12 +413,12 @@ fn chrono_duration_to_std(chrono_duration: chrono::Duration) -> std::time::Durat
 /// Returns the ordinal string of a given integer
 fn ordinal(n: i32) -> String {
     match n.abs() {
-        11 | 12 | 13 => format!("{}th", n),
+        11..=13 => format!("{}-th", n),
         _ => match n % 10 {
-            1 => format!("{}st", n),
-            2 => format!("{}nd", n),
-            3 => format!("{}rd", n),
-            _ => format!("{}th", n),
+            1 => format!("{}-st", n),
+            2 => format!("{}-nd", n),
+            3 => format!("{}-rd", n),
+            _ => format!("{}-th", n),
         },
     }
 }

@@ -1,1 +1,2 @@
-default.extend-ignore-re = ["\\{\\}nd"]
+[default.extend-words]
+"nd" = "nd" # fn ordinal
