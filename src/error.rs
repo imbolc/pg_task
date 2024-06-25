@@ -1,3 +1,4 @@
+use crate::NextStep;
 use std::{error::Error as StdError, result::Result as StdResult};
 use tracing::error;
 
@@ -19,4 +20,4 @@ pub type Result<T> = StdResult<T, Error>;
 pub type StepError = Box<dyn StdError + 'static>;
 
 /// Result returning from task steps
-pub type StepResult<T> = StdResult<T, StepError>;
+pub type StepResult<T> = StdResult<NextStep<T>, StepError>;

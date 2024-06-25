@@ -5,10 +5,13 @@
 
 mod error;
 mod macros;
+mod next_step;
 mod traits;
+mod util;
 mod worker;
 
 pub use error::{Error, Result, StepError, StepResult};
+pub use next_step::NextStep;
 pub use traits::{Scheduler, Step};
 pub use worker::Worker;
 

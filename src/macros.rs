@@ -17,10 +17,16 @@ macro_rules! task {
 
         #[async_trait::async_trait]
         impl $crate::Step<$enum> for $enum {
-            async fn step(self, db: &sqlx::PgPool) -> $crate::StepResult<Option<$enum>> {
-                Ok(match self {
-                    $(Self::$variant(inner) => inner.step(db).await?.map(Into::into),)*
-                })
+            async fn step(self, db: &sqlx::PgPool) -> $crate::StepResult<$enum> {
+                match self {
+                    $(Self::$variant(inner) => inner.step(db).await.map(|next|
+                        match next {
+                            NextStep::None => NextStep::None,
+                            NextStep::Now(x) => NextStep::Now(x.into()),
+                            NextStep::Delayed(x, d) => NextStep::Delayed(x.into(), d),
+                        }
+                    ),)*
+                }
             }
 
             fn retry_limit(&self) -> i32 {

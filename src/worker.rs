@@ -1,4 +1,4 @@
-use crate::{Step, StepError};
+use crate::{util, NextStep, Step, StepError};
 use chrono::{DateTime, Utc};
 use code_path::code_path;
 use sqlx::{
@@ -65,7 +65,7 @@ impl Task {
         if delay <= chrono::Duration::zero() {
             Duration::ZERO
         } else {
-            chrono_duration_to_std(delay)
+            util::chrono_duration_to_std(delay)
         }
     }
 }
@@ -129,8 +129,9 @@ impl<S: Step<S>> Worker<S> {
                 self.process_error(id, tried, retry_limit, retry_delay, e)
                     .await?
             }
-            Ok(None) => self.finish_task(id).await?,
-            Ok(Some(step)) => self.update_task_step(id, step).await?,
+            Ok(NextStep::None) => self.finish_task(id).await?,
+            Ok(NextStep::Now(step)) => self.update_task_step(id, step, Duration::ZERO).await?,
+            Ok(NextStep::Delayed(step, delay)) => self.update_task_step(id, step, delay).await?,
         };
         Ok(())
     }
@@ -171,7 +172,9 @@ impl<S: Step<S>> Worker<S> {
                 tx.commit()
                     .await
                     .map_err(sqlx_error!("commit on wait for a period"))?;
-                waiter.wait_for(chrono_duration_to_std(time_to_run)).await?;
+                waiter
+                    .wait_for(util::chrono_duration_to_std(time_to_run))
+                    .await?;
             } else {
                 tx.commit()
                     .await
@@ -182,7 +185,7 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Updates the tasks step
-    async fn update_task_step(&self, task_id: Uuid, step: S) -> Result<()> {
+    async fn update_task_step(&self, task_id: Uuid, step: S, delay: Duration) -> Result<()> {
         let step = match serde_json::to_string(&step)
             .map_err(|e| ErrorReport::SerializeStep(e, format!("{:?}", step)))
         {
@@ -209,7 +212,7 @@ impl<S: Step<S>> Worker<S> {
             ",
             task_id,
             step,
-            Utc::now(),
+            Utc::now() + util::std_duration_to_chrono(delay),
         )
         .execute(&self.db)
         .await
@@ -401,13 +404,6 @@ impl TaskWaiter {
         }
         Ok(())
     }
-}
-
-/// Converts a chrono duration to std, it uses absolute value of the chrono duration
-fn chrono_duration_to_std(chrono_duration: chrono::Duration) -> std::time::Duration {
-    let seconds = chrono_duration.num_seconds();
-    let nanos = chrono_duration.num_nanoseconds().unwrap_or(0) % 1_000_000_000;
-    std::time::Duration::new(seconds.unsigned_abs(), nanos.unsigned_abs() as u32)
 }
 
 /// Returns the ordinal string of a given integer

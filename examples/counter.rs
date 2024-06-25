@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pg_task::{Step, StepResult};
+use pg_task::{NextStep, Step, StepResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{env, time::Duration};
@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     init_logging()?;
 
     // Let's schedule a few tasks
-    pg_task::enqueue(&db, &Tasks::Count(Start { up_to: 2 }.into())).await?;
+    pg_task::enqueue(&db, &Tasks::Count(Start { up_to: 1000 }.into())).await?;
 
     // And run a worker
     pg_task::Worker::<Tasks>::new(db).run().await;
@@ -35,16 +35,13 @@ pub struct Start {
 }
 #[async_trait]
 impl Step<Count> for Start {
-    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Count> {
         println!("1..{}: start", self.up_to);
-        Ok(Some(
-            Proceed {
-                up_to: self.up_to,
-                started_at: Utc::now(),
-                cur: 0,
-            }
-            .into(),
-        ))
+        NextStep::now(Proceed {
+            up_to: self.up_to,
+            started_at: Utc::now(),
+            cur: 0,
+        })
     }
 }
 
@@ -59,7 +56,7 @@ impl Step<Count> for Proceed {
     const RETRY_LIMIT: i32 = 5;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Count> {
         // return Err(anyhow::anyhow!("bailing").into());
         let Self {
             up_to,
@@ -69,16 +66,13 @@ impl Step<Count> for Proceed {
         cur += 1;
         // println!("1..{up_to}: {cur}");
         if cur < up_to {
-            Ok(Some(
-                Proceed {
-                    up_to,
-                    started_at,
-                    cur,
-                }
-                .into(),
-            ))
+            NextStep::now(Proceed {
+                up_to,
+                started_at,
+                cur,
+            })
         } else {
-            Ok(Some(Finish { up_to, started_at }.into()))
+            NextStep::now(Finish { up_to, started_at })
         }
     }
 }
@@ -90,7 +84,7 @@ pub struct Finish {
 }
 #[async_trait]
 impl Step<Count> for Finish {
-    async fn step(self, _db: &PgPool) -> StepResult<Option<Count>> {
+    async fn step(self, _db: &PgPool) -> StepResult<Count> {
         let took = Utc::now() - self.started_at;
         let secs = num_seconds(took);
         let per_sec = self.up_to as f64 / secs;
@@ -100,7 +94,7 @@ impl Step<Count> for Finish {
             secs,
             per_sec.round()
         );
-        Ok(None)
+        NextStep::none()
     }
 }
 
