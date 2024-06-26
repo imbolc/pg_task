@@ -40,7 +40,7 @@ jobs:
                   components: clippy
 
             - name: Clippy
-              run: cargo clippy --features ci --bins --examples --tests -- -D warnings
+              run: cargo clippy --bins --examples --tests -- -D warnings
 
     test:
         runs-on: ubuntu-latest
@@ -55,7 +55,7 @@ jobs:
                   toolchain: stable
 
             - name: Cargo test
-              run: cargo test --features ci --bins --examples --tests
+              run: cargo test --bins --examples --tests
 
     readme:
         runs-on: ubuntu-latest
