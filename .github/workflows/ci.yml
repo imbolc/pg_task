@@ -1,64 +1,104 @@
-on: [push, pull_request]
+name: CI
+on:
+    push:
+        branches:
+            - main
+            - ci
+    pull_request:
 
-name: Continuous integration
+env:
+    SQLX_OFFLINE: true
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+    rustfmt:
+        runs-on: ubuntu-latest
 
-      - name: Format
-        run: cargo fmt -- --check
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
 
-      - name: Clippy
-        run: cargo clippy --all-features --workspace --bins --examples --tests -- -D warnings
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: nightly
+                  components: rustfmt
 
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+            - name: Cargo fmt
+              run: cargo fmt -- --check
 
-      - name: Test
-        run: cargo test --all-features --workspace --bins --examples --tests
+    clippy:
+        runs-on: ubuntu-latest
 
-  readme:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
 
-      - name: Install `cargo-sync-readme`
-        uses: actions-rs/install@v0.1
-        with:
-          crate: cargo-sync-readme
-          version: latest
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+                  components: clippy
 
-      - name: Is readme in sync?
-        run: cargo sync-readme -c
+            - name: Clippy
+              run: cargo clippy --features ci --bins --examples --tests -- -D warnings
 
-  typos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+    test:
+        runs-on: ubuntu-latest
 
-      - name: Install `typos`
-        uses: actions-rs/install@v0.1
-        with:
-          crate: typos-cli
-          version: latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
 
-      - name: Any typos?
-        run: typos
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+
+            - name: Cargo test
+              run: cargo test --features ci --bins --examples --tests
+
+    readme:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v3
+            - uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+
+            - name: Install `cargo-sync-readme`
+              uses: actions-rs/install@v0.1
+              with:
+                  crate: cargo-sync-readme
+                  version: latest
+
+            - name: Is readme in sync?
+              run: cargo sync-readme -c
+
+    typos:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
+
+            - name: Check typos in `rust` folder
+              uses: crate-ci/typos@master
+              with:
+                  files: .
+
+    cargo_sort:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
+
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+
+            - name: Install cargo-sort
+              run: cargo install cargo-sort
+
+            - name: Are Cargo configs sorted?
+              run: cargo sort -c
