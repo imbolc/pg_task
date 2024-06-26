@@ -8,6 +8,7 @@ mod macros;
 mod next_step;
 mod traits;
 mod util;
+mod waiter;
 mod worker;
 
 pub use error::{Error, Result, StepError, StepResult};

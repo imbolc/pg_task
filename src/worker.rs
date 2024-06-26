@@ -1,33 +1,29 @@
-use crate::{util, NextStep, Step, StepError};
+use crate::{util, waiter::Waiter, NextStep, Step, StepError};
 use chrono::{DateTime, Utc};
 use code_path::code_path;
 use sqlx::{
-    postgres::{PgConnection, PgListener, PgPool},
+    postgres::{PgConnection, PgPool},
     types::Uuid,
 };
 use std::{marker::PhantomData, time::Duration};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-const PG_NOTIFICATION: &str = "pg_task_changed";
-
 /// An error report to log from the worker
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
 enum ErrorReport {
-    /// Sqlx error with some context
-    #[error("sqlx: {1}")]
+    /// db error: {1}
     Sqlx(#[source] sqlx::Error, String),
-    /// Issue with task serialization - this shouldn't normally occur
-    #[error("can't serialize step {1}")]
+    /// can't serialize step: {1}
     SerializeStep(#[source] serde_json::Error, String),
-    /// Task deserialization issue - could happen if task changed while the table isn't empty
-    #[error(
-        "can't deserialize step `{1}` (the task was likely changed between the scheduling and running of the step)"
-    )]
+    /**
+    can't deserialize step (the task was likely changed between the
+    scheduling and running of the step): {1}
+    */
     DeserializeStep(#[source] serde_json::Error, String),
 }
 
-type Result<T> = std::result::Result<T, ErrorReport>;
+type ReportResult<T> = std::result::Result<T, ErrorReport>;
 
 macro_rules! sqlx_error {
     () => {
@@ -41,6 +37,7 @@ macro_rules! sqlx_error {
 /// A worker for processing tasks
 pub struct Worker<T> {
     db: PgPool,
+    waiter: Waiter,
     tasks: PhantomData<T>,
 }
 
@@ -73,18 +70,18 @@ impl Task {
 impl<S: Step<S>> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
+        let waiter = Waiter::new();
         Self {
             db,
+            waiter,
             tasks: PhantomData,
         }
     }
 
     /// Runs all ready tasks to completion and waits for new ones
-    pub async fn run(&self) {
-        self.unlock_stale_tasks()
-            .await
-            .map_err(ErrorReport::log)
-            .ok();
+    pub async fn run(&self) -> crate::Result<()> {
+        self.unlock_stale_tasks().await?;
+        self.waiter.listen(self.db.clone()).await?;
 
         // TODO concurrency
         loop {
@@ -97,14 +94,14 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Runs the next step of the task
-    async fn run_step(&self, task: Task) -> Result<()> {
+    async fn run_step(&self, task: Task) -> ReportResult<()> {
         let Task {
             id, step, tried, ..
         } = task;
         info!(
             "[{id}]{} run step {step}",
             if tried > 0 {
-                format!(" {} attempt to", ordinal(tried + 1))
+                format!(" {} attempt to", util::ordinal(tried + 1))
             } else {
                 "".into()
             },
@@ -136,14 +133,15 @@ impl<S: Step<S>> Worker<S> {
         Ok(())
     }
 
-    /// Unlocks all tasks. This is intended to run at the start of the worker as some tasks could
-    /// remain locked as running indefinitely if the previous run ended due to some kind of crash.
-    async fn unlock_stale_tasks(&self) -> Result<()> {
+    /// Unlocks all tasks. This is intended to run at the start of the worker as
+    /// some tasks could remain locked as running indefinitely if the
+    /// previous run ended due to some kind of crash.
+    async fn unlock_stale_tasks(&self) -> crate::Result<()> {
         let unlocked =
             sqlx::query!("UPDATE pg_task SET is_running = false WHERE is_running = true")
                 .execute(&self.db)
                 .await
-                .map_err(sqlx_error!())?
+                .map_err(crate::Error::UnlockStaleTasks)?
                 .rows_affected();
         if unlocked == 0 {
             debug!("No stale tasks to unlock")
@@ -154,11 +152,11 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Waits until the next task is ready, locks it as running and returns it.
-    async fn recv_task(&self) -> Result<Task> {
+    async fn recv_task(&self) -> ReportResult<Task> {
         trace!("Receiving the next task");
 
         loop {
-            let mut waiter = TaskWaiter::new(&self.db, PG_NOTIFICATION).await?;
+            let table_changes = self.waiter.subscribe();
             let mut tx = self.db.begin().await.map_err(sqlx_error!("begin"))?;
             if let Some(task) = fetch_closest_task(&mut tx).await? {
                 let time_to_run = task.wakeup_at - Utc::now();
@@ -172,20 +170,20 @@ impl<S: Step<S>> Worker<S> {
                 tx.commit()
                     .await
                     .map_err(sqlx_error!("commit on wait for a period"))?;
-                waiter
+                table_changes
                     .wait_for(util::chrono_duration_to_std(time_to_run))
-                    .await?;
+                    .await;
             } else {
                 tx.commit()
                     .await
                     .map_err(sqlx_error!("commit on wait forever"))?;
-                waiter.wait().await?;
+                table_changes.wait_forever().await;
             }
         }
     }
 
     /// Updates the tasks step
-    async fn update_task_step(&self, task_id: Uuid, step: S, delay: Duration) -> Result<()> {
+    async fn update_task_step(&self, task_id: Uuid, step: S, delay: Duration) -> ReportResult<()> {
         let step = match serde_json::to_string(&step)
             .map_err(|e| ErrorReport::SerializeStep(e, format!("{:?}", step)))
         {
@@ -223,7 +221,7 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Removes the finished task
-    async fn finish_task(&self, task_id: Uuid) -> Result<()> {
+    async fn finish_task(&self, task_id: Uuid) -> ReportResult<()> {
         info!("[{task_id}] is successfully completed");
         sqlx::query!("DELETE FROM pg_task WHERE id = $1", task_id)
             .execute(&self.db)
@@ -240,7 +238,7 @@ impl<S: Step<S>> Worker<S> {
         retry_limit: i32,
         retry_delay: Duration,
         err: StepError,
-    ) -> Result<()> {
+    ) -> ReportResult<()> {
         if tried < retry_limit {
             self.retry_task(task_id, tried, retry_limit, retry_delay, err)
                 .await
@@ -257,7 +255,7 @@ impl<S: Step<S>> Worker<S> {
         retry_limit: i32,
         delay: Duration,
         err: StepError,
-    ) -> Result<()> {
+    ) -> ReportResult<()> {
         trace!("[{task_id}] scheduling a retry");
 
         let delay =
@@ -282,13 +280,13 @@ impl<S: Step<S>> Worker<S> {
         debug!(
             "[{task_id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {}",
             source_chain::to_string(&*err),
-            attempt = ordinal(tried + 1)
+            attempt = util::ordinal(tried + 1)
         );
         Ok(())
     }
 
     /// Sets the task error
-    async fn set_task_error(&self, task_id: Uuid, err: StepError) -> Result<()> {
+    async fn set_task_error(&self, task_id: Uuid, err: StepError) -> ReportResult<()> {
         trace!("[{task_id}] saving error");
 
         let err = source_chain::to_string(&*err);
@@ -319,7 +317,7 @@ impl<S: Step<S>> Worker<S> {
 }
 
 /// Fetches the closest task to run
-async fn fetch_closest_task(con: &mut PgConnection) -> Result<Option<Task>> {
+async fn fetch_closest_task(con: &mut PgConnection) -> ReportResult<Option<Task>> {
     trace!("Fetching the closest task to run");
     let task = sqlx::query_as!(
         Task,
@@ -354,7 +352,7 @@ async fn fetch_closest_task(con: &mut PgConnection) -> Result<Option<Task>> {
     Ok(task)
 }
 
-async fn mark_task_running(con: &mut PgConnection, task_id: Uuid) -> Result<()> {
+async fn mark_task_running(con: &mut PgConnection, task_id: Uuid) -> ReportResult<()> {
     sqlx::query!(
         "
         UPDATE pg_task
@@ -368,53 +366,4 @@ async fn mark_task_running(con: &mut PgConnection, task_id: Uuid) -> Result<()> 
     .await
     .map_err(sqlx_error!())?;
     Ok(())
-}
-
-struct TaskWaiter {
-    listener: PgListener,
-}
-
-impl TaskWaiter {
-    async fn new(db: &PgPool, channel: &str) -> Result<Self> {
-        let mut listener = PgListener::connect_with(db)
-            .await
-            .map_err(sqlx_error!("connect"))?;
-        listener
-            .listen(channel)
-            .await
-            .map_err(sqlx_error!("listen"))?;
-        trace!("Listening for changes to the tasks table");
-        Ok(Self { listener })
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        trace!("⌛Waiting for the tasks table to change");
-        self.listener.recv().await.map_err(sqlx_error!())?;
-        trace!("⚡The tasks table has changed");
-        Ok(())
-    }
-
-    async fn wait_for(&mut self, period: Duration) -> Result<()> {
-        trace!("⌛Waiting for the tasks table to change for {period:?}");
-        if let Ok(result) = timeout(period, self.listener.recv()).await {
-            result.map_err(sqlx_error!())?;
-            trace!("⚡The tasks table has changed");
-        } else {
-            trace!("⏰The waiting timeout has expired");
-        }
-        Ok(())
-    }
-}
-
-/// Returns the ordinal string of a given integer
-fn ordinal(n: i32) -> String {
-    match n.abs() {
-        11..=13 => format!("{}-th", n),
-        _ => match n % 10 {
-            1 => format!("{}-st", n),
-            2 => format!("{}-nd", n),
-            3 => format!("{}-rd", n),
-            _ => format!("{}-th", n),
-        },
-    }
 }

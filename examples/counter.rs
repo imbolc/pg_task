@@ -3,7 +3,9 @@ use chrono::{DateTime, Utc};
 use pg_task::{NextStep, Step, StepResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{env, time::Duration};
+use std::time::Duration;
+
+mod util;
 
 // It wraps the task step into an enum which proxies necessary methods
 pg_task::task!(Count {
@@ -17,14 +19,13 @@ pg_task::scheduler!(Tasks { Count });
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let db = connect().await?;
-    init_logging()?;
+    let db = util::init().await?;
 
     // Let's schedule a few tasks
     pg_task::enqueue(&db, &Tasks::Count(Start { up_to: 1000 }.into())).await?;
 
     // And run a worker
-    pg_task::Worker::<Tasks>::new(db).run().await;
+    pg_task::Worker::<Tasks>::new(db).run().await?;
 
     Ok(())
 }
@@ -102,19 +103,4 @@ fn num_seconds(duration: chrono::Duration) -> f64 {
     let seconds = duration.num_seconds();
     let nanos = duration.num_nanoseconds().unwrap() % 1_000_000_000;
     seconds as f64 + (nanos as f64 / 1_000_000_000.0)
-}
-
-async fn connect() -> anyhow::Result<sqlx::PgPool> {
-    dotenv::dotenv().ok();
-    let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
-    sqlx::migrate!().run(&db).await?;
-    Ok(db)
-}
-
-fn init_logging() -> anyhow::Result<()> {
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-    Ok(())
 }
