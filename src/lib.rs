@@ -20,6 +20,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{types::Uuid, PgPool};
 use std::time::Duration;
 
+const LOST_CONNECTION_SLEEP: Duration = Duration::from_secs(1);
+
 /// Enqueues the task to be run immediately
 pub async fn enqueue(db: &PgPool, task: &impl Scheduler) -> Result<Uuid> {
     task.enqueue(db).await

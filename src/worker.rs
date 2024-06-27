@@ -1,4 +1,4 @@
-use crate::{util, waiter::Waiter, NextStep, Step, StepError};
+use crate::{util, waiter::Waiter, NextStep, Step, StepError, LOST_CONNECTION_SLEEP};
 use chrono::{DateTime, Utc};
 use code_path::code_path;
 use sqlx::{
@@ -7,7 +7,7 @@ use sqlx::{
 };
 use std::{marker::PhantomData, time::Duration};
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// An error report to log from the worker
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
@@ -85,11 +85,20 @@ impl<S: Step<S>> Worker<S> {
 
         // TODO concurrency
         loop {
-            let Ok(task) = self.recv_task().await.map_err(ErrorReport::log) else {
-                sleep(Duration::from_secs(1)).await;
-                continue;
+            match self.recv_task().await {
+                Ok(task) => {
+                    self.run_step(task).await.map_err(ErrorReport::log).ok();
+                }
+                Err(e) => {
+                    warn!(
+                        "Can't fetch a task (probably due to db connection loss):\n{}",
+                        source_chain::to_string(&e)
+                    );
+                    sleep(LOST_CONNECTION_SLEEP).await;
+                    util::wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await;
+                    warn!("Task fetching is probably restored");
+                }
             };
-            self.run_step(task).await.map_err(ErrorReport::log).ok();
         }
     }
 
@@ -151,7 +160,7 @@ impl<S: Step<S>> Worker<S> {
         Ok(())
     }
 
-    /// Waits until the next task is ready, locks it as running and returns it.
+    /// Waits until the next task is ready, marks it as running and returns it.
     async fn recv_task(&self) -> ReportResult<Task> {
         trace!("Receiving the next task");
 

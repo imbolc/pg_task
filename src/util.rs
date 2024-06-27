@@ -23,3 +23,14 @@ pub fn ordinal(n: i32) -> String {
         },
     }
 }
+
+/// Waits for the db reconnection
+pub async fn wait_for_reconnection(db: &sqlx::PgPool, sleep: std::time::Duration) {
+    while let Err(sqlx::Error::Io(_)) = sqlx::query!("SELECT id FROM pg_task LIMIT 1")
+        .fetch_optional(db)
+        .await
+    {
+        tracing::trace!("Waiting for db reconnection");
+        tokio::time::sleep(sleep).await;
+    }
+}

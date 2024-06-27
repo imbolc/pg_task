@@ -1,10 +1,11 @@
+use crate::{util, LOST_CONNECTION_SLEEP};
 use sqlx::{postgres::PgListener, PgPool};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::{futures::Notified, Notify},
-    time::timeout,
+    time::{sleep, timeout},
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// Waits for tasks table to change
 pub struct Waiter(Arc<Notify>);
@@ -32,7 +33,15 @@ impl Waiter {
         let notify = self.0.clone();
         tokio::spawn(async move {
             loop {
-                listener.recv().await.unwrap();
+                if let Err(e) = listener.recv().await {
+                    warn!("Listening for the tasks table changes is interrupted (probably due to db connection loss):\n{}", source_chain::to_string(&e));
+                    sleep(LOST_CONNECTION_SLEEP).await;
+                    util::wait_for_reconnection(&db, LOST_CONNECTION_SLEEP).await;
+                    warn!("Listening for the tasks table changes is probably restored");
+                    // Absence of `continue` isn't a bug. We have to behave as
+                    // if a change was detected since a notification could be
+                    // lost during the interruption
+                }
                 notify.notify_waiters();
             }
         });
