@@ -1,6 +1,11 @@
-use crate::{util, waiter::Waiter, NextStep, Step, StepError, LOST_CONNECTION_SLEEP};
+use crate::{
+    util::{
+        chrono_duration_to_std, db_error, ordinal, std_duration_to_chrono, wait_for_reconnection,
+    },
+    waiter::Waiter,
+    Error, NextStep, Result, Step, StepError, LOST_CONNECTION_SLEEP,
+};
 use chrono::{DateTime, Utc};
-use code_path::code_path;
 use serde::Serialize;
 use sqlx::{
     postgres::{PgConnection, PgPool},
@@ -9,31 +14,6 @@ use sqlx::{
 use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, error, info, trace, warn};
-
-/// An error report to log from the worker
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
-enum ErrorReport {
-    /// db error: {1}
-    Sqlx(#[source] sqlx::Error, String),
-    /// can't serialize step: {1}
-    SerializeStep(#[source] serde_json::Error, String),
-    /**
-    can't deserialize step (the task was likely changed between the
-    scheduling and running of the step): {1}
-    */
-    DeserializeStep(#[source] serde_json::Error, String),
-}
-
-type ReportResult<T> = std::result::Result<T, ErrorReport>;
-
-macro_rules! sqlx_error {
-    () => {
-        |e| ErrorReport::Sqlx(e, code_path!().into())
-    };
-    ($desc:expr) => {
-        |e| ErrorReport::Sqlx(e, format!("{} {}", code_path!(), $desc))
-    };
-}
 
 /// A worker for processing tasks
 pub struct Worker<T> {
@@ -49,12 +29,6 @@ struct Task {
     step: String,
     tried: i32,
     wakeup_at: DateTime<Utc>,
-}
-
-impl ErrorReport {
-    fn log(self) {
-        error!("{}", source_chain::to_string(&self));
-    }
 }
 
 impl<S: Step<S>> Worker<S> {
@@ -77,7 +51,7 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Runs all ready tasks to completion and waits for new ones
-    pub async fn run(&self) -> crate::Result<()> {
+    pub async fn run(&self) -> Result<()> {
         self.unlock_stale_tasks().await?;
         self.waiter.listen(self.db.clone()).await?;
 
@@ -89,10 +63,12 @@ impl<S: Step<S>> Worker<S> {
                         .clone()
                         .acquire_owned()
                         .await
-                        .map_err(crate::Error::UnreachableWorkerSemaphoreClosed)?;
+                        .map_err(Error::UnreachableWorkerSemaphoreClosed)?;
                     let db = self.db.clone();
                     tokio::spawn(async move {
-                        task.run_step::<S>(&db).await.map_err(ErrorReport::log).ok();
+                        if let Err(e) = task.run_step::<S>(&db).await {
+                            error!("[{}] {}", task.id, source_chain::to_string(&e));
+                        };
                         drop(permit);
                     });
                 }
@@ -102,7 +78,7 @@ impl<S: Step<S>> Worker<S> {
                         source_chain::to_string(&e)
                     );
                     sleep(LOST_CONNECTION_SLEEP).await;
-                    util::wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await;
+                    wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await;
                     warn!("Task fetching is probably restored");
                 }
             }
@@ -112,12 +88,12 @@ impl<S: Step<S>> Worker<S> {
     /// Unlocks all tasks. This is intended to run at the start of the worker as
     /// some tasks could remain locked as running indefinitely if the
     /// previous run ended due to some kind of crash.
-    async fn unlock_stale_tasks(&self) -> crate::Result<()> {
+    async fn unlock_stale_tasks(&self) -> Result<()> {
         let unlocked =
             sqlx::query!("UPDATE pg_task SET is_running = false WHERE is_running = true")
                 .execute(&self.db)
                 .await
-                .map_err(crate::Error::UnlockStaleTasks)?
+                .map_err(Error::UnlockStaleTasks)?
                 .rows_affected();
         if unlocked == 0 {
             debug!("No stale tasks to unlock")
@@ -128,31 +104,31 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Waits until the next task is ready, marks it as running and returns it.
-    async fn recv_task(&self) -> ReportResult<Task> {
+    async fn recv_task(&self) -> Result<Task> {
         trace!("Receiving the next task");
 
         loop {
             let table_changes = self.waiter.subscribe();
-            let mut tx = self.db.begin().await.map_err(sqlx_error!("begin"))?;
+            let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
             if let Some(task) = Task::fetch_closest(&mut tx).await? {
                 let time_to_run = task.wakeup_at - Utc::now();
                 if time_to_run <= chrono::Duration::zero() {
                     task.mark_running(&mut tx).await?;
                     tx.commit()
                         .await
-                        .map_err(sqlx_error!("commit on task return"))?;
+                        .map_err(db_error!("commit on task return"))?;
                     return Ok(task);
                 }
                 tx.commit()
                     .await
-                    .map_err(sqlx_error!("commit on wait for a period"))?;
+                    .map_err(db_error!("commit on wait for a period"))?;
                 table_changes
-                    .wait_for(util::chrono_duration_to_std(time_to_run))
+                    .wait_for(chrono_duration_to_std(time_to_run))
                     .await;
             } else {
                 tx.commit()
                     .await
-                    .map_err(sqlx_error!("commit on wait forever"))?;
+                    .map_err(db_error!("commit on wait forever"))?;
                 table_changes.wait_forever().await;
             }
         }
@@ -161,7 +137,7 @@ impl<S: Step<S>> Worker<S> {
 
 impl Task {
     /// Fetches the closest task to run
-    async fn fetch_closest(con: &mut PgConnection) -> ReportResult<Option<Self>> {
+    async fn fetch_closest(con: &mut PgConnection) -> Result<Option<Self>> {
         trace!("Fetching the closest task to run");
         let task = sqlx::query_as!(
             Task,
@@ -181,7 +157,7 @@ impl Task {
         )
         .fetch_optional(con)
         .await
-        .map_err(sqlx_error!("select"))?;
+        .map_err(db_error!("select"))?;
 
         if let Some(ref task) = task {
             let delay = task.delay();
@@ -196,7 +172,7 @@ impl Task {
         Ok(task)
     }
 
-    async fn mark_running(&self, con: &mut PgConnection) -> ReportResult<()> {
+    async fn mark_running(&self, con: &mut PgConnection) -> Result<()> {
         sqlx::query!(
             "
         UPDATE pg_task
@@ -208,7 +184,7 @@ impl Task {
         )
         .execute(con)
         .await
-        .map_err(sqlx_error!())?;
+        .map_err(db_error!())?;
         Ok(())
     }
 
@@ -218,31 +194,28 @@ impl Task {
         if delay <= chrono::Duration::zero() {
             Duration::ZERO
         } else {
-            util::chrono_duration_to_std(delay)
+            chrono_duration_to_std(delay)
         }
     }
 
     /// Runs the current step of the task to completion
-    async fn run_step<S: Step<S>>(&self, db: &PgPool) -> ReportResult<()> {
+    async fn run_step<S: Step<S>>(&self, db: &PgPool) -> Result<()> {
         info!(
             "[{}]{} run step {}",
             self.id,
             if self.tried > 0 {
-                format!(" {} attempt to", util::ordinal(self.tried + 1))
+                format!(" {} attempt to", ordinal(self.tried + 1))
             } else {
                 "".into()
             },
             self.step
         );
         let step: S = match serde_json::from_str(&self.step)
-            .map_err(|e| ErrorReport::DeserializeStep(e, format!("{:?}", self.step)))
+            .map_err(|e| Error::DeserializeStep(e, format!("{:?}", self.step)))
         {
             Ok(x) => x,
             Err(e) => {
-                self.save_error(db, e.into())
-                    .await
-                    .map_err(ErrorReport::log)
-                    .ok();
+                self.save_error(db, e.into()).await.ok();
                 return Ok(());
             }
         };
@@ -262,10 +235,9 @@ impl Task {
     }
 
     /// Saves the task error
-    async fn save_error(&self, db: &PgPool, err: StepError) -> ReportResult<()> {
-        trace!("[{}] saving error", self.id);
+    async fn save_error(&self, db: &PgPool, err: StepError) -> Result<()> {
+        let err_str = source_chain::to_string(&*err);
 
-        let err = source_chain::to_string(&*err);
         let (tried, step) = sqlx::query!(
             r#"
             UPDATE pg_task
@@ -277,16 +249,18 @@ impl Task {
             RETURNING tried, step::TEXT as "step!"
             "#,
             self.id,
-            &err,
+            &err_str,
             Utc::now(),
         )
         .fetch_one(db)
         .await
         .map(|r| (r.tried, r.step))
-        .map_err(sqlx_error!())?;
+        .map_err(db_error!())?;
+
         error!(
-            "[{}] resulted in an error at step {step} after {tried} attempts: {}",
-            self.id, err
+            "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
+            id = self.id,
+            attempt = ordinal(tried + 1)
         );
         Ok(())
     }
@@ -297,16 +271,13 @@ impl Task {
         db: &PgPool,
         step: impl Serialize + fmt::Debug,
         delay: Duration,
-    ) -> ReportResult<()> {
+    ) -> Result<()> {
         let step = match serde_json::to_string(&step)
-            .map_err(|e| ErrorReport::SerializeStep(e, format!("{:?}", step)))
+            .map_err(|e| Error::SerializeStep(e, format!("{:?}", step)))
         {
             Ok(x) => x,
             Err(e) => {
-                self.save_error(db, e.into())
-                    .await
-                    .map_err(ErrorReport::log)
-                    .ok();
+                self.save_error(db, e.into()).await.ok();
                 return Ok(());
             }
         };
@@ -324,23 +295,23 @@ impl Task {
                 ",
             self.id,
             step,
-            Utc::now() + util::std_duration_to_chrono(delay),
+            Utc::now() + std_duration_to_chrono(delay),
         )
         .execute(db)
         .await
-        .map_err(sqlx_error!())?;
+        .map_err(db_error!())?;
 
         debug!("[{}] step is done", self.id);
         Ok(())
     }
 
     /// Removes the finished task
-    async fn complete(&self, db: &PgPool) -> ReportResult<()> {
+    async fn complete(&self, db: &PgPool) -> Result<()> {
         info!("[{}] is successfully completed", self.id);
         sqlx::query!("DELETE FROM pg_task WHERE id = $1", self.id)
             .execute(db)
             .await
-            .map_err(sqlx_error!())?;
+            .map_err(db_error!())?;
         Ok(())
     }
 
@@ -352,7 +323,7 @@ impl Task {
         retry_limit: i32,
         retry_delay: Duration,
         err: StepError,
-    ) -> ReportResult<()> {
+    ) -> Result<()> {
         if tried < retry_limit {
             self.retry(db, tried, retry_limit, retry_delay, err).await
         } else {
@@ -368,10 +339,10 @@ impl Task {
         retry_limit: i32,
         delay: Duration,
         err: StepError,
-    ) -> ReportResult<()> {
+    ) -> Result<()> {
         trace!("[{}] scheduling a retry", self.id);
 
-        let delay = util::std_duration_to_chrono(delay);
+        let delay = std_duration_to_chrono(delay);
         let wakeup_at = Utc::now() + delay;
         sqlx::query!(
             "
@@ -387,13 +358,13 @@ impl Task {
         )
         .execute(db)
         .await
-        .map_err(sqlx_error!())?;
+        .map_err(db_error!())?;
 
         debug!(
-            "[{}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {}",
-            self.id,
-            source_chain::to_string(&*err),
-            attempt = util::ordinal(tried + 1)
+            "[{id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {err}",
+            id = self.id,
+            attempt = ordinal(tried + 1),
+            err = source_chain::to_string(&*err),
         );
         Ok(())
     }

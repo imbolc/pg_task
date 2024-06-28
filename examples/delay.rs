@@ -32,6 +32,7 @@ pub struct Sleep(u64);
 #[async_trait]
 impl Step<Sleeper> for Sleep {
     async fn step(self, _db: &PgPool) -> StepResult<Sleeper> {
+        std::fs::read_to_string("non-existing")?;
         println!("Sleeping for {} sec", self.0);
         NextStep::delay(Wakeup(self.0), Duration::from_secs(self.0))
     }

@@ -49,7 +49,8 @@ pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
 
     /// Schedules a task to run at a specified time in the future
     async fn schedule(&self, db: &PgPool, at: DateTime<Utc>) -> crate::Result<Uuid> {
-        let step = serde_json::to_string(self).map_err(Error::SerializeStep)?;
+        let step = serde_json::to_string(self)
+            .map_err(|e| Error::SerializeStep(e, format!("{self:?}")))?;
         sqlx::query!(
             "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2) RETURNING id",
             step,
