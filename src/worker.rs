@@ -1,7 +1,7 @@
 use crate::{
+    listener::Listener,
     task::Task,
     util::{chrono_duration_to_std, db_error, wait_for_reconnection},
-    waiter::Waiter,
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
 use chrono::Utc;
@@ -13,7 +13,7 @@ use tracing::{debug, error, trace, warn};
 /// A worker for processing tasks
 pub struct Worker<T> {
     db: PgPool,
-    waiter: Waiter,
+    listener: Listener,
     tasks: PhantomData<T>,
     concurrency: usize,
 }
@@ -21,11 +21,11 @@ pub struct Worker<T> {
 impl<S: Step<S>> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
-        let waiter = Waiter::new();
+        let listener = Listener::new();
         let concurrency = num_cpus::get();
         Self {
             db,
-            waiter,
+            listener,
             concurrency,
             tasks: PhantomData,
         }
@@ -40,7 +40,7 @@ impl<S: Step<S>> Worker<S> {
     /// Runs all ready tasks to completion and waits for new ones
     pub async fn run(&self) -> Result<()> {
         self.unlock_stale_tasks().await?;
-        self.waiter.listen(self.db.clone()).await?;
+        self.listener.listen(self.db.clone()).await?;
 
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
         loop {
@@ -95,7 +95,7 @@ impl<S: Step<S>> Worker<S> {
         trace!("Receiving the next task");
 
         loop {
-            let table_changes = self.waiter.subscribe();
+            let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
             if let Some(task) = Task::fetch_closest(&mut tx).await? {
                 let time_to_run = task.wakeup_at - Utc::now();

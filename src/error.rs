@@ -16,9 +16,9 @@ pub enum Error {
     /// can't unlock stale tasks
     UnlockStaleTasks(#[source] sqlx::Error),
     /// waiter can't connect to the db
-    WaiterConnect(#[source] sqlx::Error),
-    /// waiter can't start listening to tables changes
-    WaiterListen(#[source] sqlx::Error),
+    ListenerConnect(#[source] sqlx::Error),
+    /// can't start listening for tables changes
+    ListenerListen(#[source] sqlx::Error),
     /// unreachable: worker semaphore is closed
     UnreachableWorkerSemaphoreClosed(#[source] tokio::sync::AcquireError),
     /// db error: {1}

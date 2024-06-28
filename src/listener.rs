@@ -8,12 +8,12 @@ use tokio::{
 use tracing::{trace, warn};
 
 /// Waits for tasks table to change
-pub struct Waiter(Arc<Notify>);
+pub struct Listener(Arc<Notify>);
 pub struct Subscription<'a>(Notified<'a>);
 
 const PG_NOTIFICATION_CHANNEL: &str = "pg_task_changed";
 
-impl Waiter {
+impl Listener {
     /// Creates a waiter
     pub fn new() -> Self {
         let notify = Arc::new(Notify::new());
@@ -24,11 +24,11 @@ impl Waiter {
     pub async fn listen(&self, db: PgPool) -> crate::Result<()> {
         let mut listener = PgListener::connect_with(&db)
             .await
-            .map_err(crate::Error::WaiterListen)?;
+            .map_err(crate::Error::ListenerConnect)?;
         listener
             .listen(PG_NOTIFICATION_CHANNEL)
             .await
-            .map_err(crate::Error::WaiterListen)?;
+            .map_err(crate::Error::ListenerListen)?;
 
         let notify = self.0.clone();
         tokio::spawn(async move {
