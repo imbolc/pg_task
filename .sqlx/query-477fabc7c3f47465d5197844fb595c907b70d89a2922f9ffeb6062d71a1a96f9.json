@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id,\n            step,\n            tried,\n            wakeup_at\n        FROM pg_task\n        WHERE is_running = false\n          AND error IS NULL\n        ORDER BY wakeup_at\n        LIMIT 1\n        FOR UPDATE\n        ",
+  "query": "\n            SELECT\n                id,\n                step,\n                tried,\n                wakeup_at\n            FROM pg_task\n            WHERE is_running = false\n              AND error IS NULL\n            ORDER BY wakeup_at\n            LIMIT 1\n            FOR UPDATE\n            ",
   "describe": {
     "columns": [
       {
@@ -34,5 +34,5 @@
       false
     ]
   },
-  "hash": "259e9b85f83c2836821b7b06330aa472e7322325b12b6cd98ab9a64606a3c928"
+  "hash": "477fabc7c3f47465d5197844fb595c907b70d89a2922f9ffeb6062d71a1a96f9"
 }

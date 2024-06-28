@@ -6,6 +6,7 @@
 mod error;
 mod macros;
 mod next_step;
+mod task;
 mod traits;
 mod util;
 mod waiter;
