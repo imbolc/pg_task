@@ -14,13 +14,15 @@ pub enum Error {
     WaiterConnect(#[source] sqlx::Error),
     /// waiter can't start listening to tables changes
     WaiterListen(#[source] sqlx::Error),
+    /// unreachable: worker semaphore is closed
+    UnreachableWorkerSemaphoreClosed(#[source] tokio::sync::AcquireError),
 }
 
 /// The crate result
 pub type Result<T> = StdResult<T, Error>;
 
 /// Error of a task step
-pub type StepError = Box<dyn StdError + 'static>;
+pub type StepError = Box<dyn StdError + 'static + Send + Sync>;
 
 /// Result returning from task steps
 pub type StepResult<T> = StdResult<NextStep<T>, StepError>;

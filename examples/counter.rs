@@ -58,14 +58,13 @@ impl Step<Count> for Proceed {
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
     async fn step(self, _db: &PgPool) -> StepResult<Count> {
-        // return Err(anyhow::anyhow!("bailing").into());
         let Self {
             up_to,
             mut cur,
             started_at,
         } = self;
+
         cur += 1;
-        // println!("1..{up_to}: {cur}");
         if cur < up_to {
             NextStep::now(Proceed {
                 up_to,
