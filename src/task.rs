@@ -2,7 +2,6 @@ use crate::{
     util::{chrono_duration_to_std, db_error, ordinal, std_duration_to_chrono},
     Error, NextStep, Result, Step, StepError,
 };
-
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{
@@ -21,10 +20,20 @@ pub struct Task {
 }
 
 impl Task {
+    /// Returns a delay before running the task
+    pub fn wait_before_running(&self) -> Option<Duration> {
+        let delay = self.wakeup_at - Utc::now();
+        if delay <= chrono::Duration::zero() {
+            None
+        } else {
+            Some(chrono_duration_to_std(delay))
+        }
+    }
+
     /// Fetches the closest task to run
     pub async fn fetch_closest(con: &mut PgConnection) -> Result<Option<Self>> {
         trace!("Fetching the closest task to run");
-        let task = sqlx::query_as!(
+        sqlx::query_as!(
             Task,
             r#"
             SELECT
@@ -42,22 +51,12 @@ impl Task {
         )
         .fetch_optional(con)
         .await
-        .map_err(db_error!("select"))?;
-
-        if let Some(ref task) = task {
-            let delay = task.delay();
-            if delay == Duration::ZERO {
-                trace!("[{}] is to run now", task.id);
-            } else {
-                trace!("[{}] is to run in {:?}", task.id, delay);
-            }
-        } else {
-            debug!("No tasks to run");
-        }
-        Ok(task)
+        .map_err(db_error!())
     }
 
+    /// Marks the task running
     pub async fn mark_running(&self, con: &mut PgConnection) -> Result<()> {
+        trace!("[{}] mark running", self.id);
         sqlx::query!(
             "
             UPDATE pg_task
@@ -73,27 +72,17 @@ impl Task {
         Ok(())
     }
 
-    /// Returns the delay time before running the task
-    fn delay(&self) -> Duration {
-        let delay = self.wakeup_at - Utc::now();
-        if delay <= chrono::Duration::zero() {
-            Duration::ZERO
-        } else {
-            chrono_duration_to_std(delay)
-        }
-    }
-
     /// Runs the current step of the task to completion
     pub async fn run_step<S: Step<S>>(&self, db: &PgPool) -> Result<()> {
         info!(
-            "[{}]{} run step {}",
-            self.id,
-            if self.tried > 0 {
+            "[{id}]{attempt} run step {step}",
+            id = self.id,
+            attempt = if self.tried > 0 {
                 format!(" {} attempt to", ordinal(self.tried + 1))
             } else {
                 "".into()
             },
-            self.step
+            step = self.step
         );
         let step: S = match serde_json::from_str(&self.step)
             .map_err(|e| Error::DeserializeStep(e, format!("{:?}", self.step)))
@@ -109,8 +98,12 @@ impl Task {
         let retry_delay = step.retry_delay();
         match step.step(db).await {
             Err(e) => {
-                self.process_error(db, self.tried, retry_limit, retry_delay, e)
-                    .await?
+                if self.tried < retry_limit {
+                    self.retry(db, self.tried, retry_limit, retry_delay, e)
+                        .await?;
+                } else {
+                    self.save_error(db, e).await?;
+                }
             }
             Ok(NextStep::None) => self.complete(db).await?,
             Ok(NextStep::Now(step)) => self.save_next_step(db, step, Duration::ZERO).await?,
@@ -147,6 +140,7 @@ impl Task {
             id = self.id,
             attempt = ordinal(tried + 1)
         );
+
         Ok(())
     }
 
@@ -161,13 +155,10 @@ impl Task {
             .map_err(|e| Error::SerializeStep(e, format!("{:?}", step)))
         {
             Ok(x) => x,
-            Err(e) => {
-                self.save_error(db, e.into()).await.ok();
-                return Ok(());
-            }
+            Err(e) => return self.save_error(db, e.into()).await,
         };
+        info!("[{}] moved to the next step {step}", self.id);
 
-        trace!("[{}] moved to the next step {step}", self.id);
         sqlx::query!(
             "
                 UPDATE pg_task
@@ -185,8 +176,6 @@ impl Task {
         .execute(db)
         .await
         .map_err(db_error!())?;
-
-        debug!("[{}] step is done", self.id);
         Ok(())
     }
 
@@ -200,22 +189,6 @@ impl Task {
         Ok(())
     }
 
-    /// Dealing with the step error
-    async fn process_error(
-        &self,
-        db: &PgPool,
-        tried: i32,
-        retry_limit: i32,
-        retry_delay: Duration,
-        err: StepError,
-    ) -> Result<()> {
-        if tried < retry_limit {
-            self.retry(db, tried, retry_limit, retry_delay, err).await
-        } else {
-            self.save_error(db, err).await
-        }
-    }
-
     /// Schedules the task for retry
     async fn retry(
         &self,
@@ -225,10 +198,14 @@ impl Task {
         delay: Duration,
         err: StepError,
     ) -> Result<()> {
-        trace!("[{}] scheduling a retry", self.id);
-
         let delay = std_duration_to_chrono(delay);
-        let wakeup_at = Utc::now() + delay;
+        debug!(
+            "[{id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {err}",
+            id = self.id,
+            attempt = ordinal(tried + 1),
+            err = source_chain::to_string(&*err),
+        );
+
         sqlx::query!(
             "
             UPDATE pg_task
@@ -239,18 +216,12 @@ impl Task {
             WHERE id = $1
             ",
             self.id,
-            wakeup_at,
+            Utc::now() + delay,
         )
         .execute(db)
         .await
         .map_err(db_error!())?;
 
-        debug!(
-            "[{id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {err}",
-            id = self.id,
-            attempt = ordinal(tried + 1),
-            err = source_chain::to_string(&*err),
-        );
         Ok(())
     }
 }

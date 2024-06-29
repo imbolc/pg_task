@@ -1,10 +1,9 @@
 use crate::{
     listener::Listener,
     task::Task,
-    util::{chrono_duration_to_std, db_error, wait_for_reconnection},
+    util::{db_error, wait_for_reconnection},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
-use chrono::Utc;
 use sqlx::postgres::PgPool;
 use std::{marker::PhantomData, sync::Arc};
 use tokio::{sync::Semaphore, time::sleep};
@@ -31,7 +30,7 @@ impl<S: Step<S>> Worker<S> {
         }
     }
 
-    /// Sets the number of concurrent tasks, default is the number of CPUs
+    /// Sets the number of concurrent tasks, default is the number of CPU cores
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency;
         self
@@ -90,34 +89,31 @@ impl<S: Step<S>> Worker<S> {
         Ok(())
     }
 
-    /// Waits until the next task is ready, marks it as running and returns it.
+    /// Waits until the next task is ready, marks it running and returns it.
     async fn recv_task(&self) -> Result<Task> {
         trace!("Receiving the next task");
 
         loop {
             let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
-            if let Some(task) = Task::fetch_closest(&mut tx).await? {
-                let time_to_run = task.wakeup_at - Utc::now();
-                if time_to_run <= chrono::Duration::zero() {
-                    task.mark_running(&mut tx).await?;
-                    tx.commit()
-                        .await
-                        .map_err(db_error!("commit on task return"))?;
-                    return Ok(task);
-                }
-                tx.commit()
-                    .await
-                    .map_err(db_error!("commit on wait for a period"))?;
-                table_changes
-                    .wait_for(chrono_duration_to_std(time_to_run))
-                    .await;
-            } else {
-                tx.commit()
-                    .await
-                    .map_err(db_error!("commit on wait forever"))?;
+
+            let Some(task) = Task::fetch_closest(&mut tx).await? else {
+                // No tasks, waiting for the tasks table changes
+                tx.commit().await.map_err(db_error!("no tasks"))?;
                 table_changes.wait_forever().await;
-            }
+                continue;
+            };
+
+            if let Some(delay) = task.wait_before_running() {
+                // Waiting until a task is ready or for the tasks table to change
+                tx.commit().await.map_err(db_error!("wait"))?;
+                table_changes.wait_for(delay).await;
+                continue;
+            };
+
+            task.mark_running(&mut tx).await?;
+            tx.commit().await.map_err(db_error!("mark running"))?;
+            return Ok(task);
         }
     }
 }
