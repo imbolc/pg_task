@@ -5,9 +5,9 @@ use crate::{
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
 use sqlx::postgres::PgPool;
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// A worker for processing tasks
 pub struct Worker<T> {
@@ -42,9 +42,10 @@ impl<S: Step<S>> Worker<S> {
         self.listener.listen(self.db.clone()).await?;
 
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
+
         loop {
             match self.recv_task().await {
-                Ok(task) => {
+                Ok(Some(task)) => {
                     let permit = semaphore
                         .clone()
                         .acquire_owned()
@@ -57,6 +58,11 @@ impl<S: Step<S>> Worker<S> {
                         };
                         drop(permit);
                     });
+                }
+                Ok(None) => {
+                    self.wait_for_steps_to_finish(semaphore.clone()).await;
+                    info!("Stopped");
+                    return Ok(());
                 }
                 Err(e) => {
                     warn!(
@@ -90,10 +96,15 @@ impl<S: Step<S>> Worker<S> {
     }
 
     /// Waits until the next task is ready, marks it running and returns it.
-    async fn recv_task(&self) -> Result<Task> {
+    /// Returns `None` if the worker is stopped
+    async fn recv_task(&self) -> Result<Option<Task>> {
         trace!("Receiving the next task");
 
         loop {
+            if self.listener.time_to_stop_worker() {
+                return Ok(None);
+            }
+
             let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
@@ -113,7 +124,29 @@ impl<S: Step<S>> Worker<S> {
 
             task.mark_running(&mut tx).await?;
             tx.commit().await.map_err(db_error!("mark running"))?;
-            return Ok(task);
+            return Ok(Some(task));
+        }
+    }
+
+    async fn wait_for_steps_to_finish(&self, semaphore: Arc<Semaphore>) {
+        let mut logged_tasks_left = None;
+        loop {
+            let tasks_left = self.concurrency - semaphore.available_permits();
+            if tasks_left == 0 {
+                break;
+            }
+            if let Some(logged) = logged_tasks_left {
+                if logged != tasks_left {
+                    trace!("Waiting for the current steps of {tasks_left} tasks to finish...");
+                }
+            } else {
+                info!("Waiting for the current steps of {tasks_left} tasks to finish...");
+            }
+            logged_tasks_left = Some(tasks_left);
+            sleep(Duration::from_secs_f32(0.1)).await;
+        }
+        if logged_tasks_left.is_some() {
+            trace!("The current step of every task is done")
         }
     }
 }

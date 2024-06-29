@@ -1,23 +1,39 @@
 use crate::{util, LOST_CONNECTION_SLEEP};
 use sqlx::{postgres::PgListener, PgPool};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{futures::Notified, Notify},
     time::{sleep, timeout},
 };
 use tracing::{trace, warn};
 
-/// Waits for tasks table to change
-pub struct Listener(Arc<Notify>);
-pub struct Subscription<'a>(Notified<'a>);
+const NOTIFICATION_CHANNEL: &str = "pg_task_changed";
+const STOP_WORKER_NOTIFICATION: &str = "stop_worker";
 
-const PG_NOTIFICATION_CHANNEL: &str = "pg_task_changed";
+/// Waits for tasks table to change
+pub struct Listener {
+    notify: Arc<Notify>,
+    stop_worker: Arc<AtomicBool>,
+}
+
+/// Subscription to the [`Listener`] notifications
+pub struct Subscription<'a>(Notified<'a>);
 
 impl Listener {
     /// Creates a waiter
     pub fn new() -> Self {
         let notify = Arc::new(Notify::new());
-        Self(notify)
+        let stop_worker = Arc::new(AtomicBool::new(false));
+        Self {
+            notify,
+            stop_worker,
+        }
     }
 
     /// Connects to the db and starts to listen to tasks table changes
@@ -26,22 +42,28 @@ impl Listener {
             .await
             .map_err(crate::Error::ListenerConnect)?;
         listener
-            .listen(PG_NOTIFICATION_CHANNEL)
+            .listen(NOTIFICATION_CHANNEL)
             .await
             .map_err(crate::Error::ListenerListen)?;
 
-        let notify = self.0.clone();
+        let notify = self.notify.clone();
+        let stop_worker = self.stop_worker.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = listener.recv().await {
-                    warn!("Listening for the tasks table changes is interrupted (probably due to db connection loss):\n{}", source_chain::to_string(&e));
-                    sleep(LOST_CONNECTION_SLEEP).await;
-                    util::wait_for_reconnection(&db, LOST_CONNECTION_SLEEP).await;
-                    warn!("Listening for the tasks table changes is probably restored");
-                    // Absence of `continue` isn't a bug. We have to behave as
-                    // if a change was detected since a notification could be
-                    // lost during the interruption
-                }
+                match listener.recv().await {
+                    Ok(msg) => {
+                        if msg.payload() == STOP_WORKER_NOTIFICATION {
+                            trace!("Got stop-worker notification");
+                            stop_worker.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Listening for the tasks table changes is interrupted (probably due to db connection loss):\n{}", source_chain::to_string(&e));
+                        sleep(LOST_CONNECTION_SLEEP).await;
+                        util::wait_for_reconnection(&db, LOST_CONNECTION_SLEEP).await;
+                        warn!("Listening for the tasks table changes is probably restored");
+                    }
+                };
                 notify.notify_waiters();
             }
         });
@@ -53,7 +75,12 @@ impl Listener {
     /// Awaiting on the result ends on the first notification after the
     /// subscription, even if it happens between the subscription and awaiting.
     pub fn subscribe(&self) -> Subscription<'_> {
-        Subscription(self.0.notified())
+        Subscription(self.notify.notified())
+    }
+
+    /// Returns true if notification to stop worker is received
+    pub fn time_to_stop_worker(&self) -> bool {
+        self.stop_worker.load(Ordering::SeqCst)
     }
 }
 
