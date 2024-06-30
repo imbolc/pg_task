@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                wakeup_at = now()\n            WHERE id = $1\n            RETURNING tried, step::TEXT as \"step!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tried",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "step!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7b27319ca510748399f45dc950569b01f4fd7a74b7f2edbef4982c3d4d9a72d8"
+}

@@ -58,12 +58,7 @@ impl Task {
     pub async fn mark_running(&self, con: &mut PgConnection) -> Result<()> {
         trace!("[{}] mark running", self.id);
         sqlx::query!(
-            "
-            UPDATE pg_task
-            SET is_running = true,
-                updated_at = now()
-            WHERE id = $1
-            ",
+            "UPDATE pg_task SET is_running = true WHERE id = $1",
             self.id
         )
         .execute(con)
@@ -121,14 +116,12 @@ impl Task {
             UPDATE pg_task
             SET is_running = false,
                 error = $2,
-                updated_at = $3,
-                wakeup_at = $3
+                wakeup_at = now()
             WHERE id = $1
             RETURNING tried, step::TEXT as "step!"
             "#,
             self.id,
             &err_str,
-            Utc::now(),
         )
         .fetch_one(db)
         .await
@@ -161,14 +154,13 @@ impl Task {
 
         sqlx::query!(
             "
-                UPDATE pg_task
-                SET is_running = false,
-                    tried = 0,
-                    step = $2,
-                    updated_at = $3,
-                    wakeup_at = $3
-                WHERE id = $1
-                ",
+            UPDATE pg_task
+            SET is_running = false,
+                tried = 0,
+                step = $2,
+                wakeup_at = $3
+            WHERE id = $1
+            ",
             self.id,
             step,
             Utc::now() + std_duration_to_chrono(delay),
@@ -211,7 +203,6 @@ impl Task {
             UPDATE pg_task
             SET is_running = false,
                 tried = tried + 1,
-                updated_at = now(),
                 wakeup_at = $2
             WHERE id = $1
             ",
