@@ -1,9 +1,9 @@
+//! A counter task gives some idea on the worker performatnce
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_task::{NextStep, Step, StepResult};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::time::Duration;
 
 mod util;
 
@@ -54,9 +54,6 @@ pub struct Proceed {
 }
 #[async_trait]
 impl Step<Count> for Proceed {
-    const RETRY_LIMIT: i32 = 5;
-    const RETRY_DELAY: Duration = Duration::from_secs(1);
-
     async fn step(self, _db: &PgPool) -> StepResult<Count> {
         let Self {
             up_to,

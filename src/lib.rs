@@ -155,7 +155,7 @@
 //!
 //! All the communication is synchronized by the DB, so it doesn't matter how or
 //! how many workers you run. It could be a separate process as well as
-//! in-process `tokio::spawn`.
+//! in-process [`tokio::spawn`].
 //!
 //! ## Stopping Workers
 //!
@@ -187,6 +187,8 @@
 //! Use [`NextStep::delay`] instead - it schedules the next step with the delay
 //! and finishes the current one right away.
 //!
+//! You can find a runnable example in the [examples/delay.rs][delay-example]
+//!
 //! ## Retrying Steps
 //!
 //! Use [`Step::RETRY_LIMIT`] and [`Step::RETRY_DELAY`] when you need to retry a
@@ -204,6 +206,7 @@
 //! }
 //! ```
 //! [tutorial-example]: https://github.com/imbolc/pg_task/blob/main/examples/tutorial.rs
+//! [delay-example]: https://github.com/imbolc/pg_task/blob/main/examples/delay.rs
 
 #![warn(clippy::all, missing_docs, nonstandard_style, future_incompatible)]
 
