@@ -21,9 +21,9 @@ macro_rules! task {
                 match self {
                     $(Self::$variant(inner) => inner.step(db).await.map(|next|
                         match next {
-                            NextStep::None => NextStep::None,
-                            NextStep::Now(x) => NextStep::Now(x.into()),
-                            NextStep::Delayed(x, d) => NextStep::Delayed(x.into(), d),
+                            $crate::NextStep::None => $crate::NextStep::None,
+                            $crate::NextStep::Now(x) => $crate::NextStep::Now(x.into()),
+                            $crate::NextStep::Delayed(x, d) => $crate::NextStep::Delayed(x.into(), d),
                         }
                     ),)*
                 }
