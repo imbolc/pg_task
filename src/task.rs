@@ -115,6 +115,7 @@ impl Task {
             r#"
             UPDATE pg_task
             SET is_running = false,
+                tried = tried + 1,
                 error = $2,
                 wakeup_at = now()
             WHERE id = $1

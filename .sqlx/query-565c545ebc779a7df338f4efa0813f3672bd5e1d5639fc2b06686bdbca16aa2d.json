@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                error = $2,\n                wakeup_at = now()\n            WHERE id = $1\n            RETURNING tried, step::TEXT as \"step!\"\n            ",
+  "query": "\n            UPDATE pg_task\n            SET is_running = false,\n                tried = tried + 1,\n                error = $2,\n                wakeup_at = now()\n            WHERE id = $1\n            RETURNING tried, step::TEXT as \"step!\"\n            ",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "7b27319ca510748399f45dc950569b01f4fd7a74b7f2edbef4982c3d4d9a72d8"
+  "hash": "565c545ebc779a7df338f4efa0813f3672bd5e1d5639fc2b06686bdbca16aa2d"
 }
