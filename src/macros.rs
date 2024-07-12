@@ -1,7 +1,7 @@
 /// Implements enum wrapper for a single task containing all it's steps
 #[macro_export]
 macro_rules! task {
-    ($enum:ident { $($variant:ident),* }) => {
+    ($enum:ident { $($variant:ident),* $(,)? }) => {
         #[derive(Debug, serde::Deserialize, serde::Serialize)]
         pub enum $enum {
             $($variant($variant),)*
@@ -47,7 +47,7 @@ macro_rules! task {
 /// The macro implements the outer enum wrapper containing all the tasks
 #[macro_export]
 macro_rules! scheduler {
-    ($enum:ident { $($variant:ident),* }) => {
+    ($enum:ident { $($variant:ident),* $(,)? }) => {
         $crate::task!($enum { $($variant),* });
         impl $crate::Scheduler for $enum {}
     }

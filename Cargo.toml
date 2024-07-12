@@ -4,7 +4,7 @@ edition = "2021"
 license = "MIT"
 name = "pg_task"
 repository = "https://github.com/imbolc/pg_task"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies]
 async-trait = "0.1"

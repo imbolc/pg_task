@@ -11,7 +11,7 @@ mod util;
 pg_task::task!(Count {
     Start,
     Proceed,
-    Finish
+    Finish,
 });
 
 // Also we need a enum representing all the possible tasks
