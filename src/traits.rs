@@ -30,6 +30,12 @@ where
     fn retry_delay(&self) -> Duration {
         Self::RETRY_DELAY
     }
+
+    /// The step name
+    fn step_name(&self) -> &'static str {
+        let name = std::any::type_name::<Self>();
+        name.split("::").last().unwrap_or(name)
+    }
 }
 
 /// A tait to implement on the outer enum wrapper containing all the tasks

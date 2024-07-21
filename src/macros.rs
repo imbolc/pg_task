@@ -40,6 +40,12 @@ macro_rules! task {
                     $(Self::$variant(inner) => inner.retry_delay(),)*
                 }
             }
+
+            fn step_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant(inner) => inner.step_name(),)*
+                }
+            }
         }
     }
 }
@@ -50,5 +56,30 @@ macro_rules! scheduler {
     ($enum:ident { $($variant:ident),* $(,)? }) => {
         $crate::task!($enum { $($variant),* });
         impl $crate::Scheduler for $enum {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{NextStep, Step, StepResult};
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use sqlx::PgPool;
+
+    #[test]
+    fn test_step_name() {
+        task!(Task { Foo });
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct Foo;
+        #[async_trait]
+        impl Step<Task> for Foo {
+            async fn step(self, _db: &PgPool) -> StepResult<Task> {
+                NextStep::none()
+            }
+        }
+
+        assert_eq!(Foo.step_name(), "Foo");
+        assert_eq!(Task::Foo(Foo).step_name(), "Foo");
     }
 }
