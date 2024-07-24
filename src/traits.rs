@@ -2,7 +2,7 @@ use crate::{Error, StepResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
-use sqlx::{types::Uuid, PgPool};
+use sqlx::{types::Uuid, PgExecutor, PgPool};
 use std::{fmt, time::Duration};
 
 /// A tait to implement on each task step
@@ -36,19 +36,23 @@ where
 #[async_trait]
 pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
     /// Enqueues the task to be run immediately
-    async fn enqueue(&self, db: &PgPool) -> crate::Result<Uuid> {
+    async fn enqueue<'e>(&self, db: impl PgExecutor<'e>) -> crate::Result<Uuid> {
         self.schedule(db, Utc::now()).await
     }
 
     /// Schedules a task to be run after a specified delay
-    async fn delay(&self, db: &PgPool, delay: Duration) -> crate::Result<Uuid> {
+    async fn delay<'e>(&self, db: impl PgExecutor<'e>, delay: Duration) -> crate::Result<Uuid> {
         let delay =
             chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::max_value());
         self.schedule(db, Utc::now() + delay).await
     }
 
     /// Schedules a task to run at a specified time in the future
-    async fn schedule(&self, db: &PgPool, at: DateTime<Utc>) -> crate::Result<Uuid> {
+    async fn schedule<'e>(
+        &self,
+        db: impl PgExecutor<'e>,
+        at: DateTime<Utc>,
+    ) -> crate::Result<Uuid> {
         let step = serde_json::to_string(self)
             .map_err(|e| Error::SerializeStep(e, format!("{self:?}")))?;
         sqlx::query!(
