@@ -36,7 +36,7 @@ where
 #[async_trait]
 pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
     /// Enqueues the task to be run immediately
-    async fn enqueue<'e>(&self, db: impl sqlx::PgExecutor<'e>) -> crate::Result<Uuid> {
+    async fn enqueue<'e>(&self, db: impl PgExecutor<'e>) -> crate::Result<Uuid> {
         self.schedule(db, Utc::now()).await
     }
 
@@ -50,7 +50,7 @@ pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
     /// Schedules a task to run at a specified time in the future
     async fn schedule<'e>(
         &self,
-        db: impl sqlx::PgExecutor<'e>,
+        db: impl PgExecutor<'e>,
         at: DateTime<Utc>,
     ) -> crate::Result<Uuid> {
         let step = serde_json::to_string(self)
