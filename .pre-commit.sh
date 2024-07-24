@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-set -eux
+
+set -eu
+
+# Linking the script as the pre-commit hook
+SCRIPT_PATH=$(realpath "$0")
+HOOK_PATH=$(git rev-parse --git-dir)/hooks/pre-commit
+if [ "$(realpath "$HOOK_PATH")" != "$SCRIPT_PATH" ]; then
+    read -p "Link this script as the git pre-commit hook to avoid further manual running? (y/N): " answer
+    if [[ $answer =~ ^[Yy]$ ]]; then
+        ln -sf "$SCRIPT_PATH" "$HOOK_PATH"
+    fi
+fi
+
+set -x
 
 # Install tools
 cargo clippy --version &>/dev/null || rustup component add clippy
