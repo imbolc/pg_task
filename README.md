@@ -1,10 +1,8 @@
+# pg_task
+
 [![License](https://img.shields.io/crates/l/pg_task.svg)](https://choosealicense.com/licenses/mit/)
 [![Crates.io](https://img.shields.io/crates/v/pg_task.svg)](https://crates.io/crates/pg_task)
 [![Docs.rs](https://docs.rs/pg_task/badge.svg)](https://docs.rs/pg_task)
-
-<!-- cargo-sync-readme start -->
-
-# pg_task
 
 FSM-based Resumable Postgres tasks
 
@@ -209,21 +207,15 @@ impl Step<MyTask> for ApiRequest {
     }
 }
 ```
-[tutorial-example]: https://github.com/imbolc/pg_task/blob/main/examples/tutorial.rs
-[delay-example]: https://github.com/imbolc/pg_task/blob/main/examples/delay.rs
-
-<!-- cargo-sync-readme end -->
 
 ## Contributing
 
 - please run [pre-commit.sh] before sending a PR, it will check everything
-- don't change the `README.md` directly, instead change the `src/lib.rs` module level comment
-  and run [cargo-sync-readme][]
 
 ## License
 
 This project is licensed under the [MIT license](LICENSE).
 
-[cargo-sync-readme]: https://github.com/phaazon/cargo-sync-readme
-[rusty-hook]: https://github.com/swellaby/rusty-hook
 [pre-commit.sh]: https://github.com/imbolc/pg_task/blob/main/pre-commit.sh
+[delay-example]: https://github.com/imbolc/pg_task/blob/main/examples/delay.rs
+[tutorial-example]: https://github.com/imbolc/pg_task/blob/main/examples/tutorial.rs
