@@ -216,6 +216,6 @@ impl Step<MyTask> for ApiRequest {
 
 This project is licensed under the [MIT license](LICENSE).
 
-[.pre-commit.sh]: https://github.com/imbolc/pg_task/blob/main/pre-commit.sh
+[.pre-commit.sh]: https://github.com/imbolc/pg_task/blob/main/.pre-commit.sh
 [delay-example]: https://github.com/imbolc/pg_task/blob/main/examples/delay.rs
 [tutorial-example]: https://github.com/imbolc/pg_task/blob/main/examples/tutorial.rs
