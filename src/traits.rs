@@ -1,4 +1,4 @@
-use crate::{Error, StepResult};
+use crate::{util::std_duration_to_chrono, Error, StepResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
@@ -42,8 +42,7 @@ pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
 
     /// Schedules a task to be run after a specified delay
     async fn delay<'e>(&self, db: impl PgExecutor<'e>, delay: Duration) -> crate::Result<Uuid> {
-        let delay =
-            chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::max_value());
+        let delay = std_duration_to_chrono(delay);
         self.schedule(db, Utc::now() + delay).await
     }
 

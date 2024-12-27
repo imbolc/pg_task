@@ -8,7 +8,7 @@ pub fn chrono_duration_to_std(chrono_duration: chrono::Duration) -> std::time::D
 
 /// Converts a std duration to chrono
 pub fn std_duration_to_chrono(std_duration: std::time::Duration) -> chrono::Duration {
-    chrono::Duration::from_std(std_duration).unwrap_or_else(|_| chrono::Duration::max_value())
+    chrono::Duration::from_std(std_duration).unwrap_or(chrono::Duration::MAX)
 }
 
 /// Returns the ordinal string of a given integer
