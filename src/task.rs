@@ -151,7 +151,7 @@ impl Task {
             Ok(x) => x,
             Err(e) => return self.save_error(db, e.into()).await,
         };
-        info!("[{}] moved to the next step {step}", self.id);
+        debug!("[{}] moved to the next step {step}", self.id);
 
         sqlx::query!(
             "
