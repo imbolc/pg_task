@@ -1,4 +1,4 @@
-//! A counter task gives some idea on the worker performatnce
+//! A counter task gives some idea on the worker performance
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_task::{NextStep, Step, StepResult};

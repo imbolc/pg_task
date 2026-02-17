@@ -5,14 +5,14 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{types::Uuid, PgExecutor, PgPool};
 use std::{fmt, time::Duration};
 
-/// A tait to implement on each task step
+/// A trait to implement on each task step
 #[async_trait]
 pub trait Step<Task>
 where
     Task: Sized,
     Self: Into<Task> + Send + Sized + fmt::Debug + DeserializeOwned + Serialize,
 {
-    /// How many times retry_limit the step on an error
+    /// How many times to retry the step on an error
     const RETRY_LIMIT: i32 = 0;
 
     /// The time to wait between retries
@@ -32,7 +32,7 @@ where
     }
 }
 
-/// A tait to implement on the outer enum wrapper containing all the tasks
+/// A trait to implement on the outer enum wrapper containing all the tasks
 #[async_trait]
 pub trait Scheduler: fmt::Debug + DeserializeOwned + Serialize + Sized + Sync {
     /// Enqueues the task to be run immediately
