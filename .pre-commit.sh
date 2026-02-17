@@ -16,7 +16,7 @@ set -x
 
 # Install tools
 cargo clippy --version &>/dev/null || rustup component add clippy
-cargo machete --version &>/dev/null || cargo install --locked cargo-machete
+cargo shear --version >/dev/null 2>&1 || cargo install --locked cargo-shear
 cargo sort --version &>/dev/null || cargo install --locked cargo-sort
 cargo sqlx --version &>/dev/null || cargo install --locked sqlx-cli
 typos --version &>/dev/null || cargo install --locked typos-cli
@@ -26,7 +26,7 @@ cargo +nightly fmt --version &>/dev/null || rustup component add rustfmt --toolc
 
 # Checks
 typos .
-cargo machete
+cargo shear
 cargo +nightly fmt -- --check
 cargo sort -c
 cargo test --all-targets
