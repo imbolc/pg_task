@@ -38,7 +38,8 @@ cargo +nightly fmt
 Make checks pass:
 
 ```sh
-./.pre-commit.sh
+SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings
+cargo shear
 ```
 
 #### Coding style
