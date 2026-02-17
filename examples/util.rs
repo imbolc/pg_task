@@ -22,6 +22,6 @@ fn init_logging() -> Result<()> {
     Ok(())
 }
 
-// Make `cagro check --examples` happy
+// Make `cargo check --examples` happy
 #[allow(dead_code)]
 fn main() {}
