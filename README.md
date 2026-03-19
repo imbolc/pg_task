@@ -221,7 +221,8 @@ Please run [.pre-commit.sh] before sending a PR, it will check everything.
 
 ## License
 
-This project is licensed under the [MIT license](LICENSE).
+This project is licensed under the
+[MIT license](https://github.com/imbolc/pg_task/blob/main/LICENSE).
 
 [.pre-commit.sh]: https://github.com/imbolc/pg_task/blob/main/.pre-commit.sh
 [delay-example]: https://github.com/imbolc/pg_task/blob/main/examples/delay.rs
