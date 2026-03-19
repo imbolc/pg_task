@@ -10,7 +10,7 @@ mod util;
 // It wraps the task step into an enum which proxies necessary methods
 pg_task::task!(Sleeper { Sleep, Wakeup });
 
-// Also we need a enum representing all the possible tasks
+// Also we need an enum representing all the possible tasks
 pg_task::scheduler!(Tasks { Sleeper });
 
 #[tokio::main]

@@ -125,7 +125,7 @@ the final step. That's all 🎉.
 ## Scheduling Tasks
 
 Essentially scheduling a task is done by inserting a corresponding row into the
-`pg_task` table. You can do in by hands from `psql` or code in any language.
+`pg_task` table. You can do it by hand from `psql` or code in any language.
 
 There's also a few helpers to take care of the first step serialization and time
 scheduling:
@@ -180,10 +180,10 @@ SELECT EXISTS(SELECT 1 FROM pg_task WHERE is_running = true);
 Sometimes you need to delay the next step. Using [`tokio::time::sleep`] before
 returning the next step creates a couple of issues:
 
-- if the process is crashed while sleeping it wont be considered done and will
+- if the process crashes while sleeping it won't be considered done and will
   rerun on restart
 - you'd have to wait for the sleeping task to finish on
-  [gracefulshutdown](#stopping-workers)
+  [graceful shutdown](#stopping-workers)
 
 Use [`NextStep::delay`] instead - it schedules the next step with the delay and
 finishes the current one right away.

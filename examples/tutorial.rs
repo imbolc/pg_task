@@ -5,10 +5,10 @@ use sqlx::PgPool;
 
 mod util;
 
-// Creates a enum `Greeter` containing our task steps
+// Creates an enum `Greeter` containing our task steps
 pg_task::task!(Greeter { ReadName, SayHello });
 
-// Creates a enum `Tasks` representing all the possible tasks
+// Creates an enum `Tasks` representing all the possible tasks
 pg_task::scheduler!(Tasks { Greeter });
 
 #[derive(Debug, Deserialize, Serialize)]

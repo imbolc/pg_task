@@ -14,7 +14,7 @@ pg_task::task!(Count {
     Finish,
 });
 
-// Also we need a enum representing all the possible tasks
+// Also we need an enum representing all the possible tasks
 pg_task::scheduler!(Tasks { Count });
 
 #[tokio::main]

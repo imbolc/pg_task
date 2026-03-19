@@ -1,4 +1,4 @@
-/// Implements enum wrapper for a single task containing all it's steps
+/// Implements an enum wrapper for a single task containing all its steps
 #[macro_export]
 macro_rules! task {
     ($enum:ident { $($variant:ident),* $(,)? }) => {

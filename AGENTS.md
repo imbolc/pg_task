@@ -52,4 +52,6 @@ cargo shear
 
 ## Git
 
-Never ask to stage or commit anything
+- Don't look into files / folders included in `.gitignore`
+- Never ask to stage or commit anything, but after finishing a coding task,
+  suggest a commit message

@@ -26,7 +26,7 @@ pub struct Listener {
 pub struct Subscription<'a>(Notified<'a>);
 
 impl Listener {
-    /// Creates a waiter
+    /// Creates a listener
     pub fn new() -> Self {
         let notify = Arc::new(Notify::new());
         let stop_worker = Arc::new(AtomicBool::new(false));

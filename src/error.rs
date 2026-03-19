@@ -15,9 +15,9 @@ pub enum Error {
     DeserializeStep(#[source] serde_json::Error, String),
     /// can't unlock stale tasks
     UnlockStaleTasks(#[source] sqlx::Error),
-    /// waiter can't connect to the db
+    /// listener can't connect to the db
     ListenerConnect(#[source] sqlx::Error),
-    /// can't start listening for tables changes
+    /// can't start listening for table changes
     ListenerListen(#[source] sqlx::Error),
     /// unreachable: worker semaphore is closed
     UnreachableWorkerSemaphoreClosed(#[source] tokio::sync::AcquireError),
