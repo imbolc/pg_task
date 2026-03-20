@@ -1,2 +1,6 @@
-# Don't show `Cargo.lock` in `git diff`
-Cargo.lock -diff
+# Exclude from `git diff`
+/.sqlx -diff
+/Cargo.lock -diff
+
+# Exclude from `git grep`
+/.sqlx/*.* binary
