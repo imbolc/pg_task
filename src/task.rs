@@ -7,6 +7,7 @@ use serde::Serialize;
 use sqlx::{
     postgres::{PgConnection, PgPool},
     types::Uuid,
+    PgExecutor,
 };
 use std::{fmt, time::Duration};
 use tracing::{debug, error, info, trace};
@@ -67,8 +68,24 @@ impl Task {
         Ok(())
     }
 
+    /// Deserializes the current task step and marks it running.
+    /// If deserialization fails, stores the error instead and leaves the task
+    /// non-running.
+    pub(crate) async fn claim<S: Step<S>>(&self, con: &mut PgConnection) -> Result<Option<S>> {
+        let step = match self.parse_step() {
+            Ok(step) => step,
+            Err(e) => {
+                self.save_error(&mut *con, e.into(), false).await?;
+                return Ok(None);
+            }
+        };
+
+        self.mark_running(con).await?;
+        Ok(Some(step))
+    }
+
     /// Runs the current step of the task to completion
-    pub async fn run_step<S: Step<S>>(&self, db: &PgPool) -> Result<()> {
+    pub async fn run_step<S: Step<S>>(&self, db: &PgPool, step: S) -> Result<()> {
         info!(
             "[{id}]{attempt} run step {step}",
             id = self.id,
@@ -79,16 +96,6 @@ impl Task {
             },
             step = self.step
         );
-        let step: S = match serde_json::from_str(&self.step)
-            .map_err(|e| Error::DeserializeStep(e, format!("{:?}", self.step)))
-        {
-            Ok(x) => x,
-            Err(e) => {
-                self.save_error(db, e.into()).await.ok();
-                return Ok(());
-            }
-        };
-
         let retry_limit = step.retry_limit();
         let retry_delay = step.retry_delay();
         match step.step(db).await {
@@ -97,7 +104,7 @@ impl Task {
                     self.retry(db, self.tried, retry_limit, retry_delay, e)
                         .await?;
                 } else {
-                    self.save_error(db, e).await?;
+                    self.save_error(db, e, true).await?;
                 }
             }
             Ok(NextStep::None) => self.complete(db).await?,
@@ -107,33 +114,50 @@ impl Task {
         Ok(())
     }
 
-    /// Saves the task error
-    async fn save_error(&self, db: &PgPool, err: StepError) -> Result<()> {
-        let err_str = source_chain::to_string(&*err);
+    fn parse_step<S: Step<S>>(&self) -> Result<S> {
+        serde_json::from_str(&self.step)
+            .map_err(|e| Error::DeserializeStep(e, self.step.to_string()))
+    }
 
-        let (tried, step) = sqlx::query!(
+    /// Saves the task error
+    async fn save_error<'e, E>(&self, db: E, err: StepError, increment_tried: bool) -> Result<()>
+    where
+        E: PgExecutor<'e>,
+    {
+        let err_str = source_chain::to_string(&*err);
+        let tried_increment = if increment_tried { 1 } else { 0 };
+        let step = sqlx::query!(
             r#"
             UPDATE pg_task
             SET is_running = false,
-                tried = tried + 1,
+                tried = tried + $3,
                 error = $2,
                 wakeup_at = now()
             WHERE id = $1
-            RETURNING tried, step::TEXT as "step!"
+            RETURNING step::TEXT as "step!"
             "#,
             self.id,
             &err_str,
+            tried_increment,
         )
         .fetch_one(db)
         .await
-        .map(|r| (r.tried, r.step))
+        .map(|r| r.step)
         .map_err(db_error!())?;
 
-        error!(
-            "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
-            id = self.id,
-            attempt = ordinal(tried + 1)
-        );
+        if increment_tried {
+            let attempt = self.tried + 1;
+            error!(
+                "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
+                id = self.id,
+                attempt = ordinal(attempt)
+            );
+        } else {
+            error!(
+                "[{id}] couldn't deserialize step {step}: {err_str}",
+                id = self.id
+            );
+        }
 
         Ok(())
     }
@@ -146,10 +170,10 @@ impl Task {
         delay: Duration,
     ) -> Result<()> {
         let step = match serde_json::to_string(&step)
-            .map_err(|e| Error::SerializeStep(e, format!("{:?}", step)))
+            .map_err(|e| Error::SerializeStep(e, format!("{step:?}")))
         {
             Ok(x) => x,
-            Err(e) => return self.save_error(db, e.into()).await,
+            Err(e) => return self.save_error(db, e.into(), true).await,
         };
         debug!("[{}] moved to the next step {step}", self.id);
 
@@ -215,5 +239,53 @@ impl Task {
         .map_err(db_error!())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Task;
+    use crate::{NextStep, Step};
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct ValidStep;
+
+    crate::task!(TestTask { ValidStep });
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for ValidStep {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            Ok(NextStep::None)
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_marks_invalid_steps_errored(pool: PgPool) {
+        sqlx::query!(
+            "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)",
+            "not-json",
+            Utc::now(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+
+        assert!(task.claim::<TestTask>(&mut tx).await.unwrap().is_none());
+
+        tx.commit().await.unwrap();
+
+        let row = sqlx::query!("SELECT tried, is_running, error FROM pg_task LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.tried, 0);
+        assert!(!row.is_running);
+        assert!(row.error.is_some());
     }
 }

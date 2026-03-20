@@ -17,7 +17,7 @@ pub struct Worker<T> {
     concurrency: usize,
 }
 
-impl<S: Step<S>> Worker<S> {
+impl<S: Step<S> + 'static> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
         let listener = Listener::new();
@@ -45,7 +45,7 @@ impl<S: Step<S>> Worker<S> {
 
         loop {
             match self.recv_task().await {
-                Ok(Some(task)) => {
+                Ok(Some((task, step))) => {
                     let permit = semaphore
                         .clone()
                         .acquire_owned()
@@ -53,7 +53,7 @@ impl<S: Step<S>> Worker<S> {
                         .map_err(Error::UnreachableWorkerSemaphoreClosed)?;
                     let db = self.db.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = task.run_step::<S>(&db).await {
+                        if let Err(e) = task.run_step(&db, step).await {
                             error!("[{}] {}", task.id, source_chain::to_string(&e));
                         };
                         drop(permit);
@@ -97,7 +97,7 @@ impl<S: Step<S>> Worker<S> {
 
     /// Waits until the next task is ready, marks it running and returns it.
     /// Returns `None` if the worker is stopped
-    async fn recv_task(&self) -> Result<Option<Task>> {
+    async fn recv_task(&self) -> Result<Option<(Task, S)>> {
         trace!("Receiving the next task");
 
         loop {
@@ -122,9 +122,12 @@ impl<S: Step<S>> Worker<S> {
                 continue;
             };
 
-            task.mark_running(&mut tx).await?;
+            let Some(step) = task.claim(&mut tx).await? else {
+                tx.commit().await.map_err(db_error!("save error"))?;
+                continue;
+            };
             tx.commit().await.map_err(db_error!("mark running"))?;
-            return Ok(Some(task));
+            return Ok(Some((task, step)));
         }
     }
 
