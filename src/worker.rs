@@ -1,7 +1,7 @@
 use crate::{
     listener::Listener,
     task::Task,
-    util::{db_error, wait_for_reconnection},
+    util::{db_error, is_connection_error, is_pool_timeout, wait_for_reconnection},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
 use sqlx::postgres::PgPool;
@@ -43,7 +43,7 @@ impl<S: Step<S> + 'static> Worker<S> {
 
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
 
-        loop {
+        let result = loop {
             match self.recv_task().await {
                 Ok(Some((task, step))) => {
                     let permit = semaphore
@@ -60,21 +60,16 @@ impl<S: Step<S> + 'static> Worker<S> {
                     });
                 }
                 Ok(None) => {
-                    self.wait_for_steps_to_finish(semaphore.clone()).await;
-                    info!("Stopped");
-                    return Ok(());
+                    break Ok(());
                 }
                 Err(e) => {
-                    warn!(
-                        "Can't fetch a task (probably due to db connection loss):\n{}",
-                        source_chain::to_string(&e)
-                    );
-                    sleep(LOST_CONNECTION_SLEEP).await;
-                    wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await;
-                    warn!("Task fetching is probably restored");
+                    if let Err(error) = self.handle_recv_task_error(e).await {
+                        break Err(error);
+                    }
                 }
             }
-        }
+        };
+        self.finish_run(result, semaphore).await
     }
 
     /// Unlocks all tasks. This is intended to run at the start of the worker as
@@ -105,6 +100,10 @@ impl<S: Step<S> + 'static> Worker<S> {
                 return Ok(None);
             }
 
+            if let Some(error) = self.listener.take_error() {
+                return Err(error);
+            }
+
             let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
@@ -116,7 +115,7 @@ impl<S: Step<S> + 'static> Worker<S> {
             };
 
             if let Some(delay) = task.wait_before_running() {
-                // Waiting until a task is ready or for the tasks table to change
+                // Waiting until a task is ready or until the listener wakes us.
                 tx.commit().await.map_err(db_error!("wait"))?;
                 table_changes.wait_for(delay).await;
                 continue;
@@ -129,6 +128,39 @@ impl<S: Step<S> + 'static> Worker<S> {
             tx.commit().await.map_err(db_error!("mark running"))?;
             return Ok(Some((task, step)));
         }
+    }
+
+    async fn handle_recv_task_error(&self, error: Error) -> Result<()> {
+        if matches!(&error, Error::Db(db_error, _) if is_connection_error(db_error)) {
+            warn!(
+                "Task fetching stopped because the database connection was interrupted:\n{}",
+                source_chain::to_string(&error)
+            );
+            sleep(LOST_CONNECTION_SLEEP).await;
+            wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await?;
+            warn!("Task fetching resumed");
+            Ok(())
+        } else if matches!(&error, Error::Db(db_error, _) if is_pool_timeout(db_error)) {
+            warn!(
+                "Task fetching is waiting for a free database connection from the pool:\n{}",
+                source_chain::to_string(&error)
+            );
+            sleep(LOST_CONNECTION_SLEEP).await;
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    async fn finish_run(&self, result: Result<()>, semaphore: Arc<Semaphore>) -> Result<()> {
+        self.listener.shutdown();
+        // Drain in-flight steps before returning so a restarted worker can't
+        // reclaim them as stale while they are still running.
+        self.wait_for_steps_to_finish(semaphore).await;
+        if result.is_ok() {
+            info!("Stopped");
+        }
+        result
     }
 
     async fn wait_for_steps_to_finish(&self, semaphore: Arc<Semaphore>) {
@@ -151,5 +183,126 @@ impl<S: Step<S> + 'static> Worker<S> {
         if logged_tasks_left.is_some() {
             trace!("The current step of every task is done")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Worker;
+    use crate::{Error, NextStep, Step};
+    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{sync::Semaphore, time::sleep};
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct NoopStep;
+
+    crate::task!(TestTask { NoopStep });
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for NoopStep {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            Ok(NextStep::None)
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn handle_recv_task_error_returns_permanent_fetch_errors(pool: PgPool) {
+        let err = sqlx::query("SELECT missing_column FROM pg_task")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+
+        let worker = Worker::<TestTask>::new(pool);
+        let err = worker
+            .handle_recv_task_error(Error::Db(err, "test".into()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    #[tokio::test]
+    async fn handle_recv_task_error_retries_pool_timeouts() {
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        );
+
+        worker
+            .handle_recv_task_error(Error::Db(sqlx::Error::PoolTimedOut, "test".into()))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_returns_listener_errors(pool: PgPool) {
+        let worker = Worker::<TestTask>::new(pool);
+        worker
+            .listener
+            .set_error_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
+                "listener failed".into(),
+            )));
+
+        let err = worker.recv_task().await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ListenerReceive(sqlx::Error::Protocol(_))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_stops_even_if_listener_has_failed(pool: PgPool) {
+        let worker = Worker::<TestTask>::new(pool);
+        worker
+            .listener
+            .set_error_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
+                "listener failed".into(),
+            )));
+        worker.listener.stop_worker_for_tests();
+
+        assert!(worker.recv_task().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_run_waits_for_inflight_steps_before_returning_errors() {
+        let worker = Arc::new(
+            Worker::<TestTask>::new(
+                PgPoolOptions::new()
+                    .connect_lazy("postgres:///pg_task")
+                    .unwrap(),
+            )
+            .with_concurrency(1),
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+        let task = tokio::spawn({
+            let worker = worker.clone();
+            let semaphore = semaphore.clone();
+            async move {
+                worker
+                    .finish_run(
+                        Err(Error::ListenerReceive(sqlx::Error::Protocol(
+                            "listener failed".into(),
+                        ))),
+                        semaphore,
+                    )
+                    .await
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        drop(permit);
+
+        let err = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ListenerReceive(sqlx::Error::Protocol(_))
+        ));
     }
 }

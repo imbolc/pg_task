@@ -19,6 +19,8 @@ pub enum Error {
     ListenerConnect(#[source] sqlx::Error),
     /// can't start listening for table changes
     ListenerListen(#[source] sqlx::Error),
+    /// listener can't receive table change notifications
+    ListenerReceive(#[source] sqlx::Error),
     /// unreachable: worker semaphore is closed
     UnreachableWorkerSemaphoreClosed(#[source] tokio::sync::AcquireError),
     /// db error: {1}
