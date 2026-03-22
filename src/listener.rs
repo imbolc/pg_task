@@ -225,9 +225,13 @@ impl<'a> Subscription<'a> {
 mod tests {
     use super::Listener;
     use crate::Error;
-    use sqlx::postgres::PgPoolOptions;
+    use chrono::{DateTime, Utc};
+    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool, Row};
     use std::{future::pending, sync::Mutex, time::Duration};
-    use tokio::{sync::Notify, time::timeout};
+    use tokio::{
+        sync::Notify,
+        time::{sleep, timeout},
+    };
 
     #[tokio::test]
     async fn terminal_errors_wake_future_subscribers() {
@@ -280,5 +284,94 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(error.is_cancelled());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn listen_wakes_subscribers_for_task_inserts(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+
+        let subscription = listener.subscribe();
+        sqlx::query("INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)")
+            .bind("{}")
+            .bind(Utc::now())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), subscription.wait_forever())
+            .await
+            .unwrap();
+
+        assert!(!listener.time_to_stop_worker());
+        assert!(listener.take_error().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stop_worker_notifications_wake_future_subscribers(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+
+        sqlx::query("SELECT pg_notify('pg_task_changed', 'stop_worker')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if listener.time_to_stop_worker() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        timeout(
+            Duration::from_millis(50),
+            listener.subscribe().wait_forever(),
+        )
+        .await
+        .unwrap();
+
+        assert!(listener.take_error().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn updating_tasks_refreshes_updated_at(pool: PgPool) {
+        let row = sqlx::query(
+            "
+            INSERT INTO pg_task (step, wakeup_at)
+            VALUES ($1, $2)
+            RETURNING id, updated_at
+            ",
+        )
+        .bind("{}")
+        .bind(Utc::now())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let id: Uuid = row.get("id");
+        let initial_updated_at: DateTime<Utc> = row.get("updated_at");
+
+        sleep(Duration::from_millis(20)).await;
+
+        let next_updated_at: DateTime<Utc> = sqlx::query(
+            "
+            UPDATE pg_task
+            SET error = $2
+            WHERE id = $1
+            RETURNING updated_at
+            ",
+        )
+        .bind(id)
+        .bind("boom")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("updated_at");
+
+        assert!(next_updated_at > initial_updated_at);
     }
 }
