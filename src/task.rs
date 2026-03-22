@@ -379,6 +379,28 @@ mod tests {
         serde_json::to_string(step).unwrap()
     }
 
+    fn task_with_step(id: Uuid, step: &TestTask, tried: i32) -> Task {
+        Task {
+            id,
+            step: serialized_step(step),
+            tried,
+            wakeup_at: Utc::now(),
+        }
+    }
+
+    fn raw_task(id: Uuid, step: &str, tried: i32) -> Task {
+        Task {
+            id,
+            step: step.into(),
+            tried,
+            wakeup_at: Utc::now(),
+        }
+    }
+
+    fn assert_database_error(err: crate::Error) {
+        assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
+    }
+
     async fn insert_task_row(
         pool: &PgPool,
         step: &str,
@@ -485,6 +507,50 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_closest_returns_db_errors_for_query_failures(pool: PgPool) {
+        insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = Task::fetch_closest(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_running_returns_db_errors_for_update_failures(pool: PgPool) {
+        let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
+        let task = task_with_step(id, &TestTask::Valid(Valid), 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN is_running TO running_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = task.mark_running(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_returns_db_errors_when_saving_deserialization_failures_fails(pool: PgPool) {
+        let id = insert_task_row(&pool, "not-json", Utc::now(), 0, false, None).await;
+        let task = raw_task(id, "not-json", 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN error TO task_error")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = task.claim::<TestTask>(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn claim_marks_valid_steps_running(pool: PgPool) {
         let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
 
@@ -566,6 +632,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_completing_tasks_fails(pool: PgPool) {
+        let step = TestTask::Valid(Valid);
+        let id = insert_task(&pool, &step, 0, false).await;
+        let task = task_with_step(id, &step, 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_step_saves_immediate_next_step_and_resets_retries(pool: PgPool) {
         let (task, step) =
             claim_task(&pool, TestTask::AdvanceNow(AdvanceNow { value: 41 }), 2).await;
@@ -623,6 +704,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_saving_next_step_fails(pool: PgPool) {
+        let step = TestTask::AdvanceNow(AdvanceNow { value: 41 });
+        let id = insert_task(&pool, &step, 2, false).await;
+        let task = task_with_step(id, &step, 2);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_step_schedules_retries_before_the_retry_limit(pool: PgPool) {
         let retry_delay = <RetryFail as Step<TestTask>>::RETRY_DELAY;
         let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
@@ -642,6 +738,21 @@ mod tests {
             started_at + retry_delay,
             finished_at + retry_delay + ChronoDuration::seconds(1),
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_retrying_fails(pool: PgPool) {
+        let step = TestTask::RetryFail(RetryFail);
+        let id = insert_task(&pool, &step, 1, false).await;
+        let task = task_with_step(id, &step, 1);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN wakeup_at TO scheduled_at")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -666,6 +777,22 @@ mod tests {
             started_at,
             finished_at + ChronoDuration::seconds(1),
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_saving_terminal_errors_fails(pool: PgPool) {
+        let step = TestTask::RetryFail(RetryFail);
+        let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
+        let id = insert_task(&pool, &step, retry_limit, false).await;
+        let task = task_with_step(id, &step, retry_limit);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN error TO task_error")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
     }
 
     #[sqlx::test(migrations = "./migrations")]
