@@ -32,11 +32,26 @@ _The full runnable code is in [examples/tutorial.rs][tutorial-example]._
 
 We create a greeter task consisting of two steps:
 
-```rust,ignore
+```rust
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step, StepResult};
+# use serde::{Deserialize, Serialize};
+# use sqlx::PgPool;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ReadName {
     filename: String,
 }
+# #[derive(Debug, Deserialize, Serialize)]
+# pub struct SayHello {
+#     name: String,
+# }
+# pg_task::task!(Greeter { ReadName, SayHello });
+# #[async_trait]
+# impl Step<Greeter> for SayHello {
+#     async fn step(self, _db: &PgPool) -> StepResult<Greeter> {
+#         NextStep::none()
+#     }
+# }
 
 #[async_trait]
 impl Step<Greeter> for ReadName {
@@ -57,11 +72,26 @@ The first step tries to read a name from a file:
 - `NextStep::now(SayHello { name })` - move our task to the `SayHello` step
   right now
 
-```rust,ignore
+```rust
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step, StepResult};
+# use serde::{Deserialize, Serialize};
+# use sqlx::PgPool;
+# #[derive(Debug, Deserialize, Serialize)]
+# pub struct ReadName {
+#     filename: String,
+# }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SayHello {
     name: String,
 }
+# pg_task::task!(Greeter { ReadName, SayHello });
+# #[async_trait]
+# impl Step<Greeter> for ReadName {
+#     async fn step(self, _db: &PgPool) -> StepResult<Greeter> {
+#         NextStep::none()
+#     }
+# }
 #[async_trait]
 impl Step<Greeter> for SayHello {
     async fn step(self, _db: &PgPool) -> StepResult<Greeter> {
@@ -110,7 +140,7 @@ In this case, the error is due to the external world state. Let's fix it by
 creating the file:
 
 ```bash
-echo 'Fixed World' > name.txt
+echo 'Fixed World' >name.txt
 ```
 
 To rerun the task, we just need to clear its `error`:
@@ -139,21 +169,92 @@ scheduling:
 After [defining](#defining-tasks) the steps of each task, we need to wrap them
 into enums representing whole tasks via [`task!`]:
 
-```rust,ignore
+```rust
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step};
+# use sqlx::PgPool;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepA;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepB;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepC;
 pg_task::task!(Task1 { StepA, StepB });
 pg_task::task!(Task2 { StepC });
+# #[async_trait]
+# impl Step<Task1> for StepA {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task1> {
+#         NextStep::none()
+#     }
+# }
+# #[async_trait]
+# impl Step<Task1> for StepB {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task1> {
+#         NextStep::none()
+#     }
+# }
+# #[async_trait]
+# impl Step<Task2> for StepC {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task2> {
+#         NextStep::none()
+#     }
+# }
 ```
 
 One more enum is needed to combine all the possible tasks:
 
-```rust,ignore
+```rust
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step};
+# use sqlx::PgPool;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepA;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepB;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepC;
+# pg_task::task!(Task1 { StepA, StepB });
+# pg_task::task!(Task2 { StepC });
+# #[async_trait]
+# impl Step<Task1> for StepA {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task1> {
+#         NextStep::none()
+#     }
+# }
+# #[async_trait]
+# impl Step<Task1> for StepB {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task1> {
+#         NextStep::none()
+#     }
+# }
+# #[async_trait]
+# impl Step<Task2> for StepC {
+#     async fn step(self, _db: &PgPool) -> pg_task::StepResult<Task2> {
+#         NextStep::none()
+#     }
+# }
 pg_task::scheduler!(Tasks { Task1, Task2 });
 ```
 
 Now we can run the worker:
 
-```rust,ignore
+```rust
+# async fn demo(db: sqlx::PgPool) -> pg_task::Result<()> {
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step};
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct StepA;
+# pg_task::task!(Task1 { StepA });
+# pg_task::scheduler!(Tasks { Task1 });
+# #[async_trait]
+# impl Step<Task1> for StepA {
+#     async fn step(self, _db: &sqlx::PgPool) -> pg_task::StepResult<Task1> {
+#         NextStep::none()
+#     }
+# }
 pg_task::Worker::<Tasks>::new(db).run().await?;
+# Ok(())
+# }
 ```
 
 All the communication is synchronized by the DB, so it doesn't matter how or how
@@ -195,7 +296,23 @@ You can find a runnable example in the [examples/delay.rs][delay-example]
 Use [`Step::RETRY_LIMIT`] and [`Step::RETRY_DELAY`] when you need to retry a
 task on errors:
 
-```rust,ignore
+```rust
+# use async_trait::async_trait;
+# use pg_task::{NextStep, Step, StepResult};
+# use serde::{Deserialize, Serialize};
+# use sqlx::PgPool;
+# use std::time::Duration;
+# #[derive(Debug, Deserialize, Serialize)]
+# struct ProcessResult {
+#     result: String,
+# }
+# #[derive(Debug, Deserialize, Serialize)]
+# struct ApiRequest;
+# pg_task::task!(MyTask { ApiRequest, ProcessResult });
+# async fn api_request() -> Result<String, std::io::Error> {
+#     Ok(String::from("ok"))
+# }
+# #[async_trait]
 impl Step<MyTask> for ApiRequest {
     const RETRY_LIMIT: i32 = 5;
     const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -205,6 +322,12 @@ impl Step<MyTask> for ApiRequest {
         NextStep::now(ProcessResult { result })
     }
 }
+# #[async_trait]
+# impl Step<MyTask> for ProcessResult {
+#     async fn step(self, _db: &PgPool) -> StepResult<MyTask> {
+#         NextStep::none()
+#     }
+# }
 ```
 
 ## Contributing
@@ -212,7 +335,7 @@ impl Step<MyTask> for ApiRequest {
 Create and migrate a dev db:
 
 ```sh
-echo 'DATABASE_URL=postgres:///pg_task' > .env
+echo 'DATABASE_URL=postgres:///pg_task' >.env
 sqlx db create
 sqlx mig run
 ```
