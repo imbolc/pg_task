@@ -173,7 +173,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn wait_for_reconnection_returns_permanent_errors(pool: PgPool) {
-        sqlx::query("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
             .execute(&pool)
             .await
             .unwrap();
@@ -189,7 +189,7 @@ mod tests {
     async fn wait_for_reconnection_retries_pool_timeouts_until_the_database_is_available(
         pool: PgPool,
     ) {
-        let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        let db_name: String = sqlx::query_scalar!(r#"SELECT current_database() AS "db_name!""#)
             .fetch_one(&pool)
             .await
             .unwrap();

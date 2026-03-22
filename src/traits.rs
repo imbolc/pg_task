@@ -71,7 +71,7 @@ mod tests {
     use super::Scheduler;
     use crate::Error;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
     use std::time::Duration;
 
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -111,15 +111,14 @@ mod tests {
     }
 
     async fn fetch_task_row(pool: &PgPool, id: sqlx::types::Uuid) -> TaskRow {
-        let row = sqlx::query("SELECT step, wakeup_at FROM pg_task WHERE id = $1")
-            .bind(id)
+        let row = sqlx::query!("SELECT step, wakeup_at FROM pg_task WHERE id = $1", id)
             .fetch_one(pool)
             .await
             .unwrap();
 
         TaskRow {
-            step: row.get("step"),
-            wakeup_at: row.get("wakeup_at"),
+            step: row.step,
+            wakeup_at: row.wakeup_at,
         }
     }
 
@@ -201,17 +200,16 @@ mod tests {
 
         assert!(matches!(err, Error::SerializeStep(_, _)));
 
-        let row_count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM pg_task")
-            .fetch_one(&pool)
+        let row_count = sqlx::query!("SELECT id FROM pg_task")
+            .fetch_all(&pool)
             .await
-            .unwrap()
-            .get("count");
-        assert_eq!(row_count, 0);
+            .unwrap();
+        assert_eq!(row_count.len(), 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn schedule_returns_add_task_errors_for_insert_failures(pool: PgPool) {
-        sqlx::query("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
             .execute(&pool)
             .await
             .unwrap();

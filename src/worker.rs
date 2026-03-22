@@ -191,7 +191,7 @@ mod tests {
     use super::Worker;
     use crate::{Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
-    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool, Row};
+    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
     use std::{
         collections::HashMap,
         sync::{
@@ -393,21 +393,21 @@ mod tests {
         is_running: bool,
         error: Option<&str>,
     ) -> Uuid {
-        sqlx::query(
+        sqlx::query!(
             "
             INSERT INTO pg_task (step, wakeup_at, is_running, error)
             VALUES ($1, $2, $3, $4)
             RETURNING id
             ",
+            step,
+            wakeup_at,
+            is_running,
+            error,
         )
-        .bind(step)
-        .bind(wakeup_at)
-        .bind(is_running)
-        .bind(error)
         .fetch_one(pool)
         .await
         .unwrap()
-        .get("id")
+        .id
     }
 
     async fn insert_task_at(
@@ -431,15 +431,15 @@ mod tests {
     }
 
     async fn task_count(pool: &PgPool) -> i64 {
-        sqlx::query("SELECT COUNT(*) AS count FROM pg_task")
-            .fetch_one(pool)
+        sqlx::query!("SELECT id FROM pg_task")
+            .fetch_all(pool)
             .await
             .unwrap()
-            .get("count")
+            .len() as i64
     }
 
     async fn stop_worker(pool: &PgPool) {
-        sqlx::query("SELECT pg_notify('pg_task_changed', 'stop_worker')")
+        sqlx::query!("NOTIFY pg_task_changed, 'stop_worker'")
             .execute(pool)
             .await
             .unwrap();
@@ -463,8 +463,13 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn handle_recv_task_error_returns_permanent_fetch_errors(pool: PgPool) {
-        let err = sqlx::query("SELECT missing_column FROM pg_task")
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
             .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = sqlx::query!("SELECT step FROM pg_task")
+            .fetch_one(&pool)
             .await
             .unwrap_err();
 
@@ -698,16 +703,18 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let invalid_row = sqlx::query("SELECT tried, is_running, error FROM pg_task WHERE id = $1")
-            .bind(invalid_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let invalid_row = sqlx::query!(
+            "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+            invalid_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         assert_eq!(state.state().events(), vec!["complete"]);
-        assert_eq!(invalid_row.get::<i32, _>("tried"), 0);
-        assert!(!invalid_row.get::<bool, _>("is_running"));
-        assert!(invalid_row.get::<Option<String>, _>("error").is_some());
+        assert_eq!(invalid_row.tried, 0);
+        assert!(!invalid_row.is_running);
+        assert!(invalid_row.error.is_some());
         assert_eq!(task_count(&pool).await, 1);
     }
 

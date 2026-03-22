@@ -247,7 +247,7 @@ mod tests {
     use super::Task;
     use crate::{NextStep, Step};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use sqlx::{types::Uuid, PgPool, Row};
+    use sqlx::{types::Uuid, PgPool};
     use std::{io, time::Duration};
 
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -387,22 +387,22 @@ mod tests {
         is_running: bool,
         error: Option<&str>,
     ) -> Uuid {
-        sqlx::query(
+        sqlx::query!(
             "
             INSERT INTO pg_task (step, wakeup_at, tried, is_running, error)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             ",
+            step,
+            wakeup_at,
+            tried,
+            is_running,
+            error,
         )
-        .bind(step)
-        .bind(wakeup_at)
-        .bind(tried)
-        .bind(is_running)
-        .bind(error)
         .fetch_one(pool)
         .await
         .unwrap()
-        .get("id")
+        .id
     }
 
     async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
@@ -421,23 +421,23 @@ mod tests {
     }
 
     async fn fetch_task_row(pool: &PgPool, id: Uuid) -> Option<TaskRow> {
-        sqlx::query(
+        sqlx::query!(
             "
             SELECT step, wakeup_at, tried, is_running, error
             FROM pg_task
             WHERE id = $1
             ",
+            id,
         )
-        .bind(id)
         .fetch_optional(pool)
         .await
         .unwrap()
         .map(|row| TaskRow {
-            step: row.get("step"),
-            wakeup_at: row.get("wakeup_at"),
-            tried: row.get("tried"),
-            is_running: row.get("is_running"),
-            error: row.get("error"),
+            step: row.step,
+            wakeup_at: row.wakeup_at,
+            tried: row.tried,
+            is_running: row.is_running,
+            error: row.error,
         })
     }
 
@@ -458,12 +458,14 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn claim_marks_invalid_steps_errored(pool: PgPool) {
-        sqlx::query("INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)")
-            .bind("not-json")
-            .bind(Utc::now())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)",
+            "not-json",
+            Utc::now(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
@@ -472,14 +474,14 @@ mod tests {
 
         tx.commit().await.unwrap();
 
-        let row = sqlx::query("SELECT tried, is_running, error FROM pg_task LIMIT 1")
+        let row = sqlx::query!("SELECT tried, is_running, error FROM pg_task LIMIT 1")
             .fetch_one(&pool)
             .await
             .unwrap();
 
-        assert_eq!(row.get::<i32, _>("tried"), 0);
-        assert!(!row.get::<bool, _>("is_running"));
-        assert!(row.get::<Option<String>, _>("error").is_some());
+        assert_eq!(row.tried, 0);
+        assert!(!row.is_running);
+        assert!(row.error.is_some());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -226,7 +226,7 @@ mod tests {
     use super::Listener;
     use crate::Error;
     use chrono::{DateTime, Utc};
-    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool, Row};
+    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
     use std::{future::pending, sync::Mutex, time::Duration};
     use tokio::{
         sync::Notify,
@@ -346,12 +346,14 @@ mod tests {
         listener.listen(pool.clone()).await.unwrap();
 
         let subscription = listener.subscribe();
-        sqlx::query("INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)")
-            .bind("{}")
-            .bind(Utc::now())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2)",
+            "{}",
+            Utc::now(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         timeout(Duration::from_secs(1), subscription.wait_forever())
             .await
@@ -366,7 +368,7 @@ mod tests {
         let listener = Listener::new();
         listener.listen(pool.clone()).await.unwrap();
 
-        sqlx::query("SELECT pg_notify('pg_task_changed', 'stop_worker')")
+        sqlx::query!("NOTIFY pg_task_changed, 'stop_worker'")
             .execute(&pool)
             .await
             .unwrap();
@@ -394,37 +396,37 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn updating_tasks_refreshes_updated_at(pool: PgPool) {
-        let row = sqlx::query(
+        let row = sqlx::query!(
             "
             INSERT INTO pg_task (step, wakeup_at)
             VALUES ($1, $2)
             RETURNING id, updated_at
             ",
+            "{}",
+            Utc::now(),
         )
-        .bind("{}")
-        .bind(Utc::now())
         .fetch_one(&pool)
         .await
         .unwrap();
-        let id: Uuid = row.get("id");
-        let initial_updated_at: DateTime<Utc> = row.get("updated_at");
+        let id: Uuid = row.id;
+        let initial_updated_at: DateTime<Utc> = row.updated_at;
 
         sleep(Duration::from_millis(20)).await;
 
-        let next_updated_at: DateTime<Utc> = sqlx::query(
+        let next_updated_at: DateTime<Utc> = sqlx::query!(
             "
             UPDATE pg_task
             SET error = $2
             WHERE id = $1
             RETURNING updated_at
             ",
+            id,
+            "boom",
         )
-        .bind(id)
-        .bind("boom")
         .fetch_one(&pool)
         .await
         .unwrap()
-        .get("updated_at");
+        .updated_at;
 
         assert!(next_updated_at > initial_updated_at);
     }
