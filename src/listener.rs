@@ -500,6 +500,48 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn closing_the_pool_retains_terminal_wakeups_for_future_subscribers(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+
+        let close_pool = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.close().await;
+            }
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if listener
+                    .error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        timeout(
+            Duration::from_millis(50),
+            listener.subscribe().wait_forever(),
+        )
+        .await
+        .unwrap();
+        close_pool.await.unwrap();
+
+        assert!(matches!(
+            listener.take_error(),
+            Some(Error::ListenerReceive(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn updating_tasks_refreshes_updated_at(pool: PgPool) {
         let row = sqlx::query!(
             "
