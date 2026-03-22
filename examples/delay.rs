@@ -47,3 +47,36 @@ impl Step<Sleeper> for Wakeup {
         NextStep::none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn lazy_pool() -> PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sleep_schedules_a_matching_wakeup() {
+        let next = Sleep(3).step(&lazy_pool()).await.unwrap();
+
+        match next {
+            NextStep::Delayed(Sleeper::Wakeup(Wakeup(seconds)), delay) => {
+                assert_eq!(seconds, 3);
+                assert_eq!(delay, Duration::from_secs(3));
+            }
+            _ => panic!("expected the delayed wakeup step"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wakeup_finishes_the_task() {
+        assert!(matches!(
+            Wakeup(3).step(&lazy_pool()).await.unwrap(),
+            NextStep::None
+        ));
+    }
+}
