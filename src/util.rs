@@ -103,10 +103,35 @@ pub(crate) use db_error;
 #[cfg(test)]
 mod tests {
     use super::{
-        is_connection_error, is_pool_timeout, is_retryable_database_error, wait_for_reconnection,
+        chrono_duration_to_std, is_connection_error, is_pool_timeout, is_retryable_database_error,
+        ordinal, std_duration_to_chrono, wait_for_reconnection,
     };
+    use chrono::Duration as ChronoDuration;
     use sqlx::PgPool;
     use std::{io, time::Duration};
+
+    #[test]
+    fn chrono_duration_to_std_uses_the_absolute_value() {
+        let duration = ChronoDuration::seconds(-1) - ChronoDuration::milliseconds(250);
+
+        assert_eq!(
+            chrono_duration_to_std(duration),
+            Duration::from_millis(1250)
+        );
+    }
+
+    #[test]
+    fn std_duration_to_chrono_saturates_on_overflow() {
+        assert_eq!(std_duration_to_chrono(Duration::MAX), ChronoDuration::MAX);
+    }
+
+    #[test]
+    fn ordinal_handles_teens_and_negative_numbers() {
+        assert_eq!(ordinal(1), "1st");
+        assert_eq!(ordinal(12), "12th");
+        assert_eq!(ordinal(23), "23rd");
+        assert_eq!(ordinal(-4), "-4th");
+    }
 
     #[test]
     fn transport_connection_errors_are_retryable() {

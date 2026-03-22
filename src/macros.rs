@@ -52,3 +52,70 @@ macro_rules! scheduler {
         impl $crate::Scheduler for $enum {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use std::time::Duration;
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct First;
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Second;
+
+    crate::task!(MacroTask { First, Second });
+    crate::scheduler!(MacroScheduler { MacroTask });
+
+    #[async_trait::async_trait]
+    impl crate::Step<MacroTask> for First {
+        const RETRY_LIMIT: i32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+        async fn step(self, _db: &PgPool) -> crate::StepResult<MacroTask> {
+            crate::NextStep::delay(Second, Self::RETRY_DELAY)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Step<MacroTask> for Second {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<MacroTask> {
+            crate::NextStep::none()
+        }
+    }
+
+    fn assert_scheduler<T: crate::Scheduler>() {}
+
+    #[test]
+    fn task_macro_implements_from_for_each_variant() {
+        let task: MacroTask = First.into();
+
+        assert!(matches!(task, MacroTask::First(First)));
+    }
+
+    #[test]
+    fn scheduler_macro_implements_the_scheduler_trait() {
+        assert_scheduler::<MacroScheduler>();
+    }
+
+    #[tokio::test]
+    async fn task_macro_forwards_step_and_retry_metadata() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+        let task = MacroTask::First(First);
+
+        assert_eq!(crate::Step::<MacroTask>::retry_limit(&task), 3);
+        assert_eq!(
+            crate::Step::<MacroTask>::retry_delay(&task),
+            Duration::from_millis(25),
+        );
+
+        match crate::Step::<MacroTask>::step(task, &pool).await.unwrap() {
+            crate::NextStep::Delayed(MacroTask::Second(Second), delay) => {
+                assert_eq!(delay, Duration::from_millis(25));
+            }
+            _ => panic!("expected the delayed second step"),
+        }
+    }
+}
