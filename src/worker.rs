@@ -441,6 +441,24 @@ mod tests {
         insert_task_at(pool, step, Utc::now(), is_running).await;
     }
 
+    async fn connect_to_current_db(
+        pool: &PgPool,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> PgPool {
+        let db_name: String = sqlx::query_scalar!(r#"SELECT current_database() AS "db_name!""#)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(&format!("postgres:///{db_name}"))
+            .await
+            .unwrap()
+    }
+
     async fn task_count(pool: &PgPool) -> i64 {
         sqlx::query!("SELECT id FROM pg_task")
             .fetch_all(pool)
@@ -626,6 +644,42 @@ mod tests {
 
         assert_eq!(state.state().events(), vec!["advance", "finish"]);
         assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_listener_errors_when_the_pool_is_closed(pool: PgPool) {
+        let worker = spawn_worker(pool.clone());
+
+        sleep(Duration::from_millis(100)).await;
+        pool.close().await;
+
+        let err = timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ListenerReceive(sqlx::Error::PoolClosed)
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_recovers_from_pool_timeouts_until_a_stop_notification_arrives(pool: PgPool) {
+        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker = spawn_worker(worker_pool);
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(!worker.is_finished());
+
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]

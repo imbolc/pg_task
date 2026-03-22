@@ -241,6 +241,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listen_returns_connect_errors_for_unavailable_databases() {
+        let listener = Listener::new();
+        let db = PgPoolOptions::new()
+            .connect_lazy(&format!(
+                "postgres:///pg_task_missing_{}",
+                Utc::now().timestamp_micros()
+            ))
+            .unwrap();
+
+        let err = listener.listen(db).await.unwrap_err();
+
+        assert!(matches!(err, Error::ListenerConnect(_)));
+    }
+
+    #[tokio::test]
     async fn terminal_errors_wake_future_subscribers() {
         let listener = Listener::new();
         listener.set_error_and_notify_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
@@ -458,6 +473,30 @@ mod tests {
         .unwrap();
 
         assert!(listener.take_error().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn closing_the_pool_surfaces_listener_errors_to_subscribers(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+
+        let subscription = listener.subscribe();
+        let close_pool = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.close().await;
+            }
+        });
+
+        timeout(Duration::from_secs(1), subscription.wait_forever())
+            .await
+            .unwrap();
+        close_pool.await.unwrap();
+
+        assert!(matches!(
+            listener.take_error(),
+            Some(Error::ListenerReceive(sqlx::Error::PoolClosed))
+        ));
     }
 
     #[sqlx::test(migrations = "./migrations")]
