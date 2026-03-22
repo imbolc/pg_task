@@ -526,6 +526,34 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_unlock_stale_task_errors(pool: PgPool) {
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN is_running TO running_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = Worker::<TestTask>::new(pool).run().await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::UnlockStaleTasks(sqlx::Error::Database(_))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_listener_startup_errors(pool: PgPool) {
+        let worker = Worker::<TestTask>::new(pool);
+        worker.listener.fail_next_listen_for_tests();
+
+        let err = worker.run().await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ListenerListen(sqlx::Error::Protocol(_))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn handle_recv_task_error_returns_permanent_fetch_errors(pool: PgPool) {
         sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
             .execute(&pool)
@@ -616,6 +644,21 @@ mod tests {
         worker.listener.stop_worker_for_tests();
 
         assert!(worker.recv_task().await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_returns_begin_errors_when_the_pool_is_closed(pool: PgPool) {
+        let worker = Worker::<TestTask>::new(pool.clone());
+        pool.close().await;
+
+        let err = worker.recv_task().await.unwrap_err();
+
+        match err {
+            Error::Db(sqlx::Error::PoolClosed, context) => {
+                assert!(context.contains("begin"));
+            }
+            _ => panic!("expected a pool-closed begin error"),
+        }
     }
 
     #[tokio::test]

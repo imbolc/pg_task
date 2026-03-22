@@ -63,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
 
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
@@ -128,5 +130,95 @@ mod tests {
             .unwrap(),
             NextStep::None
         ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn worker_retries_missing_files_until_the_world_is_fixed(pool: PgPool) {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let task = Tasks::Greeter(
+            ReadName {
+                filename: path.display().to_string(),
+            }
+            .into(),
+        );
+        let id = pg_task::enqueue(&pool, &task).await.unwrap();
+        let worker = tokio::spawn({
+            let pool = pool.clone();
+            async move { pg_task::Worker::<Tasks>::new(pool).run().await }
+        });
+
+        let errored_row = timeout(Duration::from_secs(8), async {
+            loop {
+                let row = sqlx::query!(
+                    "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+                    id,
+                )
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some(row) = row {
+                    if row.error.is_some() {
+                        return row;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            errored_row.tried,
+            <ReadName as Step<Greeter>>::RETRY_LIMIT + 1
+        );
+        assert!(!errored_row.is_running);
+        assert!(errored_row.error.is_some());
+
+        std::fs::write(&path, "Fixed World").unwrap();
+        sqlx::query!(
+            "
+            UPDATE pg_task
+            SET error = $2
+            WHERE id = $1
+            RETURNING updated_at
+            ",
+            id,
+            None::<String>,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if sqlx::query!(
+                    "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+                    id,
+                )
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .is_none()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sqlx::query!("NOTIFY pg_task_changed, 'stop_worker'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        std::fs::remove_file(path).unwrap();
     }
 }

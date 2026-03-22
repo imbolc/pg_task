@@ -23,6 +23,8 @@ pub struct Listener {
     stop_worker: Arc<AtomicBool>,
     error: Arc<Mutex<Option<crate::Error>>>,
     task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    #[cfg(test)]
+    fail_listen: Arc<AtomicBool>,
 }
 
 /// Subscription to the [`Listener`] notifications
@@ -40,6 +42,8 @@ impl Listener {
             stop_worker,
             error,
             task,
+            #[cfg(test)]
+            fail_listen: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -48,8 +52,12 @@ impl Listener {
         let mut listener = PgListener::connect_with(&db)
             .await
             .map_err(crate::Error::ListenerConnect)?;
-        listener
-            .listen(NOTIFICATION_CHANNEL)
+        #[cfg(test)]
+        Self::listen_on_channel(&mut listener, &self.fail_listen)
+            .await
+            .map_err(crate::Error::ListenerListen)?;
+        #[cfg(not(test))]
+        Self::listen_on_channel(&mut listener)
             .await
             .map_err(crate::Error::ListenerListen)?;
 
@@ -134,6 +142,22 @@ impl Listener {
         }
     }
 
+    #[cfg(test)]
+    async fn listen_on_channel(
+        listener: &mut PgListener,
+        fail_listen: &AtomicBool,
+    ) -> Result<(), sqlx::Error> {
+        if fail_listen.swap(false, Ordering::SeqCst) {
+            return Err(sqlx::Error::Protocol("listener listen failure".into()));
+        }
+        listener.listen(NOTIFICATION_CHANNEL).await
+    }
+
+    #[cfg(not(test))]
+    async fn listen_on_channel(listener: &mut PgListener) -> Result<(), sqlx::Error> {
+        listener.listen(NOTIFICATION_CHANNEL).await
+    }
+
     async fn handle_recv_error(
         error_slot: &Mutex<Option<crate::Error>>,
         notify: &Notify,
@@ -196,6 +220,11 @@ impl Listener {
     #[cfg(test)]
     pub(crate) fn set_task_for_tests(&self, task: tokio::task::AbortHandle) {
         Self::replace_task(&self.task, task);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_listen_for_tests(&self) {
+        self.fail_listen.store(true, Ordering::SeqCst);
     }
 }
 
@@ -264,6 +293,19 @@ mod tests {
         let err = listener.listen(db).await.unwrap_err();
 
         assert!(matches!(err, Error::ListenerConnect(_)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn listen_returns_listener_listen_errors_when_subscribing_fails(pool: PgPool) {
+        let listener = Listener::new();
+        listener.fail_next_listen_for_tests();
+
+        let err = listener.listen(pool).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ListenerListen(sqlx::Error::Protocol(_))
+        ));
     }
 
     #[tokio::test]
