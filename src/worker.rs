@@ -190,20 +190,239 @@ impl<S: Step<S> + 'static> Worker<S> {
 mod tests {
     use super::Worker;
     use crate::{Error, NextStep, Step};
-    use sqlx::{postgres::PgPoolOptions, PgPool};
-    use std::{sync::Arc, time::Duration};
-    use tokio::{sync::Semaphore, time::sleep};
+    use chrono::Utc;
+    use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex, OnceLock,
+        },
+        time::Duration,
+    };
+    use tokio::{
+        sync::{Notify, Semaphore},
+        time::{sleep, timeout},
+    };
 
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
-    pub(super) struct NoopStep;
+    pub(super) struct Noop;
 
-    crate::task!(TestTask { NoopStep });
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Advance {
+        key: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Finish {
+        key: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Complete {
+        key: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Blocking {
+        key: u64,
+    }
+
+    crate::task!(TestTask {
+        Noop,
+        Advance,
+        Finish,
+        Complete,
+        Blocking,
+    });
 
     #[async_trait::async_trait]
-    impl Step<TestTask> for NoopStep {
+    impl Step<TestTask> for Noop {
         async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
             Ok(NextStep::None)
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Advance {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            step_state(self.key).record("advance");
+            NextStep::now(Finish { key: self.key })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Finish {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            step_state(self.key).record("finish");
+            NextStep::none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Complete {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            step_state(self.key).record("complete");
+            NextStep::none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Blocking {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            let state = step_state(self.key);
+            state.record("started");
+            state.wait_for_release().await;
+            state.record("completed");
+            NextStep::none()
+        }
+    }
+
+    struct StepState {
+        events: Mutex<Vec<&'static str>>,
+        events_changed: Notify,
+        release: Notify,
+    }
+
+    impl StepState {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                events_changed: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            self.events_changed.notify_waiters();
+        }
+
+        fn release(&self) {
+            self.release.notify_waiters();
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        async fn wait_for_events(&self, count: usize) {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if self
+                        .events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len()
+                        >= count
+                    {
+                        return;
+                    }
+                    self.events_changed.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn wait_for_release(&self) {
+            self.release.notified().await;
+        }
+    }
+
+    struct StepStateGuard {
+        key: u64,
+        state: Arc<StepState>,
+    }
+
+    impl StepStateGuard {
+        fn new() -> Self {
+            let key = NEXT_STEP_STATE_KEY.fetch_add(1, Ordering::Relaxed);
+            let state = Arc::new(StepState::new());
+            step_states()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, state.clone());
+            Self { key, state }
+        }
+
+        fn key(&self) -> u64 {
+            self.key
+        }
+
+        fn state(&self) -> Arc<StepState> {
+            self.state.clone()
+        }
+    }
+
+    impl Drop for StepStateGuard {
+        fn drop(&mut self) {
+            step_states()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+
+    static NEXT_STEP_STATE_KEY: AtomicU64 = AtomicU64::new(1);
+    static STEP_STATES: OnceLock<Mutex<HashMap<u64, Arc<StepState>>>> = OnceLock::new();
+
+    fn step_states() -> &'static Mutex<HashMap<u64, Arc<StepState>>> {
+        STEP_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn step_state(key: u64) -> Arc<StepState> {
+        step_states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .unwrap()
+    }
+
+    async fn insert_task(pool: &PgPool, step: &TestTask, is_running: bool) {
+        sqlx::query(
+            "
+            INSERT INTO pg_task (step, wakeup_at, is_running)
+            VALUES ($1, $2, $3)
+            ",
+        )
+        .bind(serde_json::to_string(step).unwrap())
+        .bind(Utc::now())
+        .bind(is_running)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn task_count(pool: &PgPool) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS count FROM pg_task")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get("count")
+    }
+
+    async fn stop_worker(pool: &PgPool) {
+        sqlx::query("SELECT pg_notify('pg_task_changed', 'stop_worker')")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn spawn_worker(pool: PgPool) -> tokio::task::JoinHandle<crate::Result<()>> {
+        tokio::spawn(async move {
+            Worker::<TestTask>::new(pool)
+                .with_concurrency(1)
+                .run()
+                .await
+        })
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -304,5 +523,111 @@ mod tests {
             err,
             Error::ListenerReceive(sqlx::Error::Protocol(_))
         ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_processes_followup_steps_to_completion(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Advance(Advance { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        state.state().wait_for_events(2).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["advance", "finish"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_wakes_up_for_tasks_inserted_while_idle(pool: PgPool) {
+        let state = StepStateGuard::new();
+        let worker = spawn_worker(pool.clone());
+
+        sleep(Duration::from_millis(100)).await;
+        insert_task(
+            &pool,
+            &TestTask::Complete(Complete { key: state.key() }),
+            false,
+        )
+        .await;
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["complete"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_unlocks_stale_tasks_before_processing(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Complete(Complete { key: state.key() }),
+            true,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["complete"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_stops_after_running_steps_finish(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!worker.is_finished());
+
+        state.state().release();
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["started", "completed"]);
+        assert_eq!(task_count(&pool).await, 0);
     }
 }
