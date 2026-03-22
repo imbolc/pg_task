@@ -194,6 +194,7 @@ mod tests {
     use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
     use std::{
         collections::HashMap,
+        io,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc, Mutex, OnceLock,
@@ -386,6 +387,16 @@ mod tests {
             .unwrap()
     }
 
+    fn connection_error() -> Error {
+        Error::Db(
+            sqlx::Error::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker connection dropped",
+            )),
+            "test".into(),
+        )
+    }
+
     async fn insert_raw_task(
         pool: &PgPool,
         step: &str,
@@ -494,6 +505,32 @@ mod tests {
             .handle_recv_task_error(Error::Db(sqlx::Error::PoolTimedOut, "test".into()))
             .await
             .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn handle_recv_task_error_waits_for_reconnection_after_connection_errors(pool: PgPool) {
+        let worker = Worker::<TestTask>::new(pool);
+
+        worker
+            .handle_recv_task_error(connection_error())
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn handle_recv_task_error_returns_reconnection_failures(pool: PgPool) {
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let worker = Worker::<TestTask>::new(pool);
+        let err = worker
+            .handle_recv_task_error(connection_error())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Db(sqlx::Error::Database(_), _)));
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -227,11 +227,18 @@ mod tests {
     use crate::Error;
     use chrono::{DateTime, Utc};
     use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
-    use std::{future::pending, sync::Mutex, time::Duration};
+    use std::{future::pending, io, sync::Mutex, time::Duration};
     use tokio::{
         sync::Notify,
         time::{sleep, timeout},
     };
+
+    fn connection_error() -> sqlx::Error {
+        sqlx::Error::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "listener connection dropped",
+        ))
+    }
 
     #[tokio::test]
     async fn terminal_errors_wake_future_subscribers() {
@@ -251,6 +258,22 @@ mod tests {
             listener.take_error(),
             Some(Error::ListenerReceive(sqlx::Error::Protocol(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_returns_when_a_wakeup_arrives_before_the_timeout() {
+        let listener = Listener::new();
+        let subscription = listener.subscribe();
+
+        listener.stop_worker_for_tests();
+
+        timeout(
+            Duration::from_millis(50),
+            subscription.wait_for(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert!(listener.time_to_stop_worker());
     }
 
     #[tokio::test]
@@ -299,6 +322,49 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take(),
             Some(Error::ListenerReceive(sqlx::Error::Protocol(_)))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn connection_errors_resume_listening_after_the_database_recovers(pool: PgPool) {
+        let error_slot = Mutex::new(None);
+        let notify = Notify::new();
+        let subscription = notify.notified();
+
+        assert!(
+            !Listener::handle_recv_error(&error_slot, &notify, &pool, connection_error(),).await
+        );
+        assert!(timeout(Duration::from_millis(50), subscription)
+            .await
+            .is_err());
+        assert!(error_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn connection_errors_become_terminal_when_reconnection_fails(pool: PgPool) {
+        let error_slot = Mutex::new(None);
+        let notify = Notify::new();
+        let subscription = notify.notified();
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            Listener::handle_recv_error(&error_slot, &notify, &pool, connection_error(),).await
+        );
+        timeout(Duration::from_millis(50), subscription)
+            .await
+            .unwrap();
+        assert!(matches!(
+            error_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+            Some(Error::Db(sqlx::Error::Database(_), _))
         ));
     }
 
