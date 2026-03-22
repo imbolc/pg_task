@@ -240,6 +240,17 @@ mod tests {
         ))
     }
 
+    fn init_tracing() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .without_time()
+                .try_init();
+        });
+    }
+
     #[tokio::test]
     async fn listen_returns_connect_errors_for_unavailable_databases() {
         let listener = Listener::new();
@@ -293,6 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_timeouts_do_not_become_terminal_listener_errors() {
+        init_tracing();
         let error_slot = Mutex::new(None);
         let notify = Notify::new();
         let db = PgPoolOptions::new()
@@ -311,6 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_recv_errors_are_stored_and_notify_waiters() {
+        init_tracing();
         let error_slot = Mutex::new(None);
         let notify = Notify::new();
         let subscription = notify.notified();
@@ -342,6 +355,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn connection_errors_resume_listening_after_the_database_recovers(pool: PgPool) {
+        init_tracing();
         let error_slot = Mutex::new(None);
         let notify = Notify::new();
         let subscription = notify.notified();
@@ -360,6 +374,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn connection_errors_become_terminal_when_reconnection_fails(pool: PgPool) {
+        init_tracing();
         let error_slot = Mutex::new(None);
         let notify = Notify::new();
         let subscription = notify.notified();

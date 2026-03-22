@@ -206,6 +206,17 @@ mod tests {
         time::{sleep, timeout},
     };
 
+    fn init_tracing() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .without_time()
+                .try_init();
+        });
+    }
+
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     pub(super) struct Noop;
 
@@ -537,6 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_recv_task_error_retries_pool_timeouts() {
+        init_tracing();
         let worker = Worker::<TestTask>::new(
             PgPoolOptions::new()
                 .connect_lazy("postgres:///pg_task")
@@ -551,6 +563,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn handle_recv_task_error_waits_for_reconnection_after_connection_errors(pool: PgPool) {
+        init_tracing();
         let worker = Worker::<TestTask>::new(pool);
 
         worker
@@ -607,6 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_run_waits_for_inflight_steps_before_returning_errors() {
+        init_tracing();
         let worker = Arc::new(
             Worker::<TestTask>::new(
                 PgPoolOptions::new()
@@ -643,6 +657,43 @@ mod tests {
             err,
             Error::ListenerReceive(sqlx::Error::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_steps_to_finish_rechecks_when_the_inflight_task_count_changes() {
+        init_tracing();
+        let worker = Arc::new(
+            Worker::<TestTask>::new(
+                PgPoolOptions::new()
+                    .connect_lazy("postgres:///pg_task")
+                    .unwrap(),
+            )
+            .with_concurrency(2),
+        );
+        let semaphore = Arc::new(Semaphore::new(2));
+        let first = semaphore.clone().acquire_owned().await.unwrap();
+        let second = semaphore.clone().acquire_owned().await.unwrap();
+
+        let wait = tokio::spawn({
+            let worker = worker.clone();
+            let semaphore = semaphore.clone();
+            async move {
+                worker.wait_for_steps_to_finish(semaphore).await;
+            }
+        });
+
+        sleep(Duration::from_millis(10)).await;
+        drop(first);
+
+        sleep(Duration::from_millis(150)).await;
+        assert!(!wait.is_finished());
+
+        drop(second);
+
+        timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]

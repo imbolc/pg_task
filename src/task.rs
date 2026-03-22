@@ -250,6 +250,17 @@ mod tests {
     use sqlx::{types::Uuid, PgPool};
     use std::{io, time::Duration};
 
+    fn init_tracing() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .without_time()
+                .try_init();
+        });
+    }
+
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     pub(super) struct Valid;
 
@@ -654,6 +665,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_completes_tasks(pool: PgPool) {
+        init_tracing();
         let (task, step) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
 
         task.run_step(&pool, step).await.unwrap();
@@ -750,6 +762,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_schedules_retries_before_the_retry_limit(pool: PgPool) {
+        init_tracing();
         let retry_delay = <RetryFail as Step<TestTask>>::RETRY_DELAY;
         let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
         let started_at = Utc::now();
@@ -787,6 +800,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_saves_terminal_errors_after_retry_limit(pool: PgPool) {
+        init_tracing();
         let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
         let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), retry_limit).await;
         let started_at = Utc::now();
