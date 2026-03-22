@@ -272,6 +272,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_recv_errors_are_stored_and_notify_waiters() {
+        let error_slot = Mutex::new(None);
+        let notify = Notify::new();
+        let subscription = notify.notified();
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(
+            Listener::handle_recv_error(
+                &error_slot,
+                &notify,
+                &db,
+                sqlx::Error::Protocol("listener failed".into()),
+            )
+            .await
+        );
+        timeout(Duration::from_millis(50), subscription)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            error_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+            Some(Error::ListenerReceive(sqlx::Error::Protocol(_)))
+        ));
+    }
+
+    #[tokio::test]
     async fn dropping_listener_aborts_background_task() {
         let listener = Listener::new();
         let task = tokio::spawn(pending::<()>());
@@ -284,6 +315,29 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn replacing_listener_task_aborts_the_previous_background_task() {
+        let listener = Listener::new();
+        let first_task = tokio::spawn(pending::<()>());
+        let second_task = tokio::spawn(pending::<()>());
+        listener.set_task_for_tests(first_task.abort_handle());
+        listener.set_task_for_tests(second_task.abort_handle());
+
+        let first_error = timeout(Duration::from_millis(50), first_task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.is_cancelled());
+
+        drop(listener);
+
+        let second_error = timeout(Duration::from_millis(50), second_task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(second_error.is_cancelled());
     }
 
     #[sqlx::test(migrations = "./migrations")]

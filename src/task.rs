@@ -379,22 +379,35 @@ mod tests {
         serde_json::to_string(step).unwrap()
     }
 
-    async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
+    async fn insert_task_row(
+        pool: &PgPool,
+        step: &str,
+        wakeup_at: DateTime<Utc>,
+        tried: i32,
+        is_running: bool,
+        error: Option<&str>,
+    ) -> Uuid {
         sqlx::query(
             "
-            INSERT INTO pg_task (step, wakeup_at, tried, is_running)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO pg_task (step, wakeup_at, tried, is_running, error)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             ",
         )
-        .bind(serialized_step(step))
-        .bind(Utc::now())
+        .bind(step)
+        .bind(wakeup_at)
         .bind(tried)
         .bind(is_running)
+        .bind(error)
         .fetch_one(pool)
         .await
         .unwrap()
         .get("id")
+    }
+
+    async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
+        let step = serialized_step(step);
+        insert_task_row(pool, &step, Utc::now(), tried, is_running, None).await
     }
 
     async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask) {
@@ -485,6 +498,60 @@ mod tests {
         assert_eq!(row.tried, 0);
         assert!(row.is_running);
         assert!(row.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_closest_ignores_running_and_errored_tasks_and_picks_the_earliest_eligible_one(
+        pool: PgPool,
+    ) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(3),
+            0,
+            true,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(2),
+            0,
+            false,
+            Some("boom"),
+        )
+        .await;
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(task.id, expected);
+        assert_eq!(task.step, valid);
+        assert_eq!(task.tried, 0);
+        assert!(task.wait_before_running().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]

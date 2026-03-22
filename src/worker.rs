@@ -190,8 +190,8 @@ impl<S: Step<S> + 'static> Worker<S> {
 mod tests {
     use super::Worker;
     use crate::{Error, NextStep, Step};
-    use chrono::Utc;
-    use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool, Row};
     use std::{
         collections::HashMap,
         sync::{
@@ -386,19 +386,48 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_task(pool: &PgPool, step: &TestTask, is_running: bool) {
+    async fn insert_raw_task(
+        pool: &PgPool,
+        step: &str,
+        wakeup_at: chrono::DateTime<Utc>,
+        is_running: bool,
+        error: Option<&str>,
+    ) -> Uuid {
         sqlx::query(
             "
-            INSERT INTO pg_task (step, wakeup_at, is_running)
-            VALUES ($1, $2, $3)
+            INSERT INTO pg_task (step, wakeup_at, is_running, error)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
             ",
         )
-        .bind(serde_json::to_string(step).unwrap())
-        .bind(Utc::now())
+        .bind(step)
+        .bind(wakeup_at)
         .bind(is_running)
-        .execute(pool)
+        .bind(error)
+        .fetch_one(pool)
         .await
-        .unwrap();
+        .unwrap()
+        .get("id")
+    }
+
+    async fn insert_task_at(
+        pool: &PgPool,
+        step: &TestTask,
+        wakeup_at: chrono::DateTime<Utc>,
+        is_running: bool,
+    ) -> Uuid {
+        insert_raw_task(
+            pool,
+            &serde_json::to_string(step).unwrap(),
+            wakeup_at,
+            is_running,
+            None,
+        )
+        .await
+    }
+
+    async fn insert_task(pool: &PgPool, step: &TestTask, is_running: bool) {
+        insert_task_at(pool, step, Utc::now(), is_running).await;
     }
 
     async fn task_count(pool: &PgPool) -> i64 {
@@ -417,9 +446,16 @@ mod tests {
     }
 
     fn spawn_worker(pool: PgPool) -> tokio::task::JoinHandle<crate::Result<()>> {
+        spawn_worker_with_concurrency(pool, 1)
+    }
+
+    fn spawn_worker_with_concurrency(
+        pool: PgPool,
+        concurrency: usize,
+    ) -> tokio::task::JoinHandle<crate::Result<()>> {
         tokio::spawn(async move {
             Worker::<TestTask>::new(pool)
-                .with_concurrency(1)
+                .with_concurrency(concurrency)
                 .run()
                 .await
         })
@@ -577,6 +613,38 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_waits_for_future_tasks_to_become_ready_without_notifications(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task_at(
+            &pool,
+            &TestTask::Complete(Complete { key: state.key() }),
+            Utc::now() + ChronoDuration::milliseconds(150),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        assert!(
+            timeout(Duration::from_millis(50), state.state().wait_for_events(1))
+                .await
+                .is_err()
+        );
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["complete"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_unlocks_stale_tasks_before_processing(pool: PgPool) {
         let state = StepStateGuard::new();
         insert_task(
@@ -599,6 +667,48 @@ mod tests {
 
         assert_eq!(state.state().events(), vec!["complete"]);
         assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_skips_invalid_tasks_and_keeps_processing_ready_tasks(pool: PgPool) {
+        let invalid_id = insert_raw_task(
+            &pool,
+            "not-json",
+            Utc::now() - ChronoDuration::milliseconds(10),
+            false,
+            None,
+        )
+        .await;
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Complete(Complete { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let invalid_row = sqlx::query("SELECT tried, is_running, error FROM pg_task WHERE id = $1")
+            .bind(invalid_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["complete"]);
+        assert_eq!(invalid_row.get::<i32, _>("tried"), 0);
+        assert!(!invalid_row.get::<bool, _>("is_running"));
+        assert!(invalid_row.get::<Option<String>, _>("error").is_some());
+        assert_eq!(task_count(&pool).await, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -628,6 +738,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.state().events(), vec!["started", "completed"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_processes_multiple_blocking_steps_up_to_the_concurrency_limit(pool: PgPool) {
+        let first = StepStateGuard::new();
+        let second = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: first.key() }),
+            false,
+        )
+        .await;
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: second.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker_with_concurrency(pool.clone(), 2);
+
+        first.state().wait_for_events(1).await;
+        second.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+
+        assert!(!worker.is_finished());
+
+        first.state().release();
+        second.state().release();
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.state().events(), vec!["started", "completed"]);
+        assert_eq!(second.state().events(), vec!["started", "completed"]);
         assert_eq!(task_count(&pool).await, 0);
     }
 }

@@ -107,7 +107,7 @@ mod tests {
         ordinal, std_duration_to_chrono, wait_for_reconnection,
     };
     use chrono::Duration as ChronoDuration;
-    use sqlx::PgPool;
+    use sqlx::{postgres::PgPoolOptions, PgPool};
     use std::{io, time::Duration};
 
     #[test]
@@ -128,6 +128,7 @@ mod tests {
     #[test]
     fn ordinal_handles_teens_and_negative_numbers() {
         assert_eq!(ordinal(1), "1st");
+        assert_eq!(ordinal(2), "2nd");
         assert_eq!(ordinal(12), "12th");
         assert_eq!(ordinal(23), "23rd");
         assert_eq!(ordinal(-4), "-4th");
@@ -182,5 +183,33 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn wait_for_reconnection_retries_pool_timeouts_until_the_database_is_available(
+        pool: PgPool,
+    ) {
+        let db_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let retry_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(20))
+            .connect(&format!("postgres:///{db_name}"))
+            .await
+            .unwrap();
+        let held_connection = retry_pool.acquire().await.unwrap();
+        let wait_pool = retry_pool.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_reconnection(&wait_pool, Duration::from_millis(10)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+
+        drop(held_connection);
+
+        waiter.await.unwrap().unwrap();
     }
 }
