@@ -229,12 +229,18 @@ mod tests {
         key: u64,
     }
 
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct FailSavingError {
+        key: u64,
+    }
+
     crate::task!(TestTask {
         Noop,
         Advance,
         Finish,
         Complete,
         Blocking,
+        FailSavingError,
     });
 
     #[async_trait::async_trait]
@@ -276,6 +282,24 @@ mod tests {
             state.wait_for_release().await;
             state.record("completed");
             NextStep::none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for FailSavingError {
+        async fn step(self, db: &PgPool) -> crate::StepResult<TestTask> {
+            let state = step_state(self.key);
+            state.record("started");
+            sqlx::query!("ALTER TABLE pg_task RENAME COLUMN error TO task_error")
+                .execute(db)
+                .await
+                .unwrap();
+            state.record("save error failed");
+            Err(io::Error::other("step failed").into())
+        }
+
+        fn retry_limit(&self) -> i32 {
+            0
         }
     }
 
@@ -709,6 +733,32 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_processes_noop_tasks_to_completion(pool: PgPool) {
+        insert_task(&pool, &TestTask::Noop(Noop), false).await;
+
+        let worker = spawn_worker(pool.clone());
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if task_count(&pool).await == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_waits_for_future_tasks_to_become_ready_without_notifications(pool: PgPool) {
         let state = StepStateGuard::new();
         insert_task_at(
@@ -837,6 +887,29 @@ mod tests {
 
         assert_eq!(state.state().events(), vec!["started", "completed"]);
         assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_fetch_errors_after_spawned_step_persistence_errors(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::FailSavingError(FailSavingError { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool.clone());
+
+        state.state().wait_for_events(2).await;
+        let err = timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(state.state().events(), vec!["started", "save error failed"]);
+        assert!(matches!(err, Error::Db(sqlx::Error::Database(_), _)));
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -220,4 +220,9 @@ mod tests {
 
         assert!(matches!(err, Error::AddTask(sqlx::Error::Database(_))));
     }
+
+    #[test]
+    fn unserializable_task_deserializes_from_unit() {
+        serde_json::from_str::<UnserializableTask>("null").unwrap();
+    }
 }

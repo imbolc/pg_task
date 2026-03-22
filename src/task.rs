@@ -506,6 +506,36 @@ mod tests {
         assert!(row.error.is_some());
     }
 
+    #[test]
+    fn unserializable_deserializes_from_unit() {
+        serde_json::from_str::<Unserializable>("null").unwrap();
+    }
+
+    #[tokio::test]
+    async fn followup_step_returns_none() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(matches!(
+            crate::Step::<TestTask>::step(TestTask::Followup(Followup { value: 7 }), &pool)
+                .await
+                .unwrap(),
+            NextStep::None
+        ));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "the test never executes the unserializable step")]
+    async fn unserializable_step_panics_if_executed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        let _ =
+            crate::Step::<TestTask>::step(TestTask::Unserializable(Unserializable), &pool).await;
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn fetch_closest_returns_db_errors_for_query_failures(pool: PgPool) {
         insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;

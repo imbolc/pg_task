@@ -118,4 +118,18 @@ mod tests {
             _ => panic!("expected the delayed second step"),
         }
     }
+
+    #[tokio::test]
+    async fn task_macro_forwards_terminal_steps() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(matches!(
+            crate::Step::<MacroTask>::step(MacroTask::Second(Second), &pool)
+                .await
+                .unwrap(),
+            crate::NextStep::None
+        ));
+    }
 }
