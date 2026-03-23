@@ -105,6 +105,8 @@ fn num_seconds(duration: chrono::Duration) -> f64 {
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
 
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
@@ -198,5 +200,42 @@ mod tests {
         let duration = chrono::Duration::seconds(2) + chrono::Duration::milliseconds(250);
 
         assert!((num_seconds(duration) - 2.25).abs() < f64::EPSILON);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn worker_counts_to_completion(pool: PgPool) {
+        let id = pg_task::enqueue(&pool, &Tasks::Count(Start { up_to: 3 }.into()))
+            .await
+            .unwrap();
+        let worker = tokio::spawn({
+            let pool = pool.clone();
+            async move { pg_task::Worker::<Tasks>::new(pool).run().await }
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if sqlx::query!("SELECT id FROM pg_task WHERE id = $1", id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sqlx::query!("NOTIFY pg_task_changed, 'stop_worker'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

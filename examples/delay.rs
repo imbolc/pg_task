@@ -51,7 +51,10 @@ impl Step<Sleeper> for Wakeup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
 
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
@@ -78,5 +81,79 @@ mod tests {
             Wakeup(3).step(&lazy_pool()).await.unwrap(),
             NextStep::None
         ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn worker_persists_delayed_wakeup_before_completing_it(pool: PgPool) {
+        let started_at = Utc::now();
+        let id = pg_task::enqueue(&pool, &Tasks::Sleeper(Sleep(1).into()))
+            .await
+            .unwrap();
+        let worker = tokio::spawn({
+            let pool = pool.clone();
+            async move { pg_task::Worker::<Tasks>::new(pool).run().await }
+        });
+
+        let delayed_row = timeout(Duration::from_millis(500), async {
+            loop {
+                let row = sqlx::query!("SELECT step, wakeup_at FROM pg_task WHERE id = $1", id,)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                if let Some(row) = row {
+                    if row.step == serde_json::to_string(&Tasks::Sleeper(Wakeup(1).into())).unwrap()
+                    {
+                        return row;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(delayed_row.wakeup_at >= started_at + ChronoDuration::seconds(1));
+
+        assert!(timeout(Duration::from_millis(400), async {
+            loop {
+                if sqlx::query!("SELECT id FROM pg_task WHERE id = $1", id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_err());
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if sqlx::query!("SELECT id FROM pg_task WHERE id = $1", id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sqlx::query!("NOTIFY pg_task_changed, 'stop_worker'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
