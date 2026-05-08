@@ -5,7 +5,7 @@ use crate::{
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
 use sqlx::postgres::PgPool;
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, error, info, trace, warn};
 
@@ -14,14 +14,14 @@ pub struct Worker<T> {
     db: PgPool,
     listener: Listener,
     tasks: PhantomData<T>,
-    concurrency: usize,
+    concurrency: NonZeroUsize,
 }
 
 impl<S: Step<S> + 'static> Worker<S> {
     /// Creates a new worker
     pub fn new(db: PgPool) -> Self {
         let listener = Listener::new();
-        let concurrency = num_cpus::get();
+        let concurrency = NonZeroUsize::new(num_cpus::get()).unwrap_or(NonZeroUsize::MIN);
         Self {
             db,
             listener,
@@ -31,7 +31,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     /// Sets the number of concurrent tasks, default is the number of CPU cores
-    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+    pub fn with_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
         self.concurrency = concurrency;
         self
     }
@@ -41,7 +41,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         self.unlock_stale_tasks().await?;
         self.listener.listen(self.db.clone()).await?;
 
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
+        let semaphore = Arc::new(Semaphore::new(self.concurrency.get()));
 
         let result = loop {
             match self.recv_task().await {
@@ -166,7 +166,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     async fn wait_for_steps_to_finish(&self, semaphore: Arc<Semaphore>) {
         let mut logged_tasks_left = None;
         loop {
-            let tasks_left = self.concurrency - semaphore.available_permits();
+            let tasks_left = self.concurrency.get() - semaphore.available_permits();
             if tasks_left == 0 {
                 break;
             }
@@ -195,6 +195,7 @@ mod tests {
     use std::{
         collections::HashMap,
         io,
+        num::NonZeroUsize,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc, Mutex, OnceLock,
@@ -509,6 +510,10 @@ mod tests {
             .unwrap();
     }
 
+    fn nonzero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
     fn spawn_worker(pool: PgPool) -> tokio::task::JoinHandle<crate::Result<()>> {
         spawn_worker_with_concurrency(pool, 1)
     }
@@ -519,7 +524,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<crate::Result<()>> {
         tokio::spawn(async move {
             Worker::<TestTask>::new(pool)
-                .with_concurrency(concurrency)
+                .with_concurrency(nonzero(concurrency))
                 .run()
                 .await
         })
@@ -670,7 +675,7 @@ mod tests {
                     .connect_lazy("postgres:///pg_task")
                     .unwrap(),
             )
-            .with_concurrency(1),
+            .with_concurrency(nonzero(1)),
         );
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -711,7 +716,7 @@ mod tests {
                     .connect_lazy("postgres:///pg_task")
                     .unwrap(),
             )
-            .with_concurrency(2),
+            .with_concurrency(nonzero(2)),
         );
         let semaphore = Arc::new(Semaphore::new(2));
         let first = semaphore.clone().acquire_owned().await.unwrap();
