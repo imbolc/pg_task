@@ -120,6 +120,25 @@ impl Task {
         Ok(())
     }
 
+    /// Renews all live task leases owned by a worker.
+    pub(crate) async fn renew_leases(db: &PgPool, lease: TaskLease) -> Result<u64> {
+        trace!("Renewing task leases for worker {}", lease.worker_id);
+        sqlx::query!(
+            r#"
+            UPDATE pg_task
+            SET lock_expires_at = $2
+            WHERE locked_by = $1
+              AND lock_expires_at > now()
+            "#,
+            lease.worker_id,
+            lease.expires_at(),
+        )
+        .execute(db)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(db_error!("renew leases"))
+    }
+
     /// Deserializes the current task step and marks it running.
     /// If deserialization fails, stores the error instead and leaves the task
     /// non-running.
@@ -826,6 +845,67 @@ mod tests {
             finished_at + ChronoDuration::seconds(61),
         );
         assert!(row.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn renew_leases_extends_only_live_owned_leases(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        let owned = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+        let owned_expires_at = now + ChronoDuration::seconds(30);
+        set_task_lease(&pool, owned, worker_id(), owned_expires_at).await;
+        let expired = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+        let expired_expires_at = now - ChronoDuration::seconds(1);
+        set_task_lease(&pool, expired, worker_id(), expired_expires_at).await;
+        let other_worker = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+        let other_worker_expires_at = now + ChronoDuration::seconds(30);
+        set_task_lease(
+            &pool,
+            other_worker,
+            other_worker_id(),
+            other_worker_expires_at,
+        )
+        .await;
+
+        let started_at = Utc::now();
+        let renewed = Task::renew_leases(&pool, task_lease()).await.unwrap();
+        let finished_at = Utc::now();
+
+        assert_eq!(renewed, 1);
+        let owned = fetch_task_row(&pool, owned).await.unwrap();
+        assert_timestamp_between(
+            owned.lock_expires_at.unwrap(),
+            started_at + ChronoDuration::seconds(60),
+            finished_at + ChronoDuration::seconds(61),
+        );
+        let expired = fetch_task_row(&pool, expired).await.unwrap();
+        assert!(expired.lock_expires_at.unwrap() < started_at);
+        let other_worker = fetch_task_row(&pool, other_worker).await.unwrap();
+        assert!(other_worker.lock_expires_at.unwrap() < started_at + ChronoDuration::seconds(45));
     }
 
     #[sqlx::test(migrations = "./migrations")]
