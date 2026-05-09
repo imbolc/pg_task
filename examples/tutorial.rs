@@ -151,7 +151,7 @@ mod tests {
         let errored_row = timeout(Duration::from_secs(8), async {
             loop {
                 let row = sqlx::query!(
-                    "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+                    "SELECT tried, locked_by, lock_expires_at, error FROM pg_task WHERE id = $1",
                     id,
                 )
                 .fetch_optional(&pool)
@@ -172,7 +172,8 @@ mod tests {
             errored_row.tried,
             <ReadName as Step<Greeter>>::RETRY_LIMIT + 1
         );
-        assert!(!errored_row.is_running);
+        assert!(errored_row.locked_by.is_none());
+        assert!(errored_row.lock_expires_at.is_none());
         assert!(errored_row.error.is_some());
 
         std::fs::write(&path, "Fixed World").unwrap();
@@ -193,7 +194,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             loop {
                 if sqlx::query!(
-                    "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+                    "SELECT tried, locked_by, lock_expires_at, error FROM pg_task WHERE id = $1",
                     id,
                 )
                 .fetch_optional(&pool)

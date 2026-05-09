@@ -116,14 +116,15 @@ final error message. Let's look into the DB to find out what happened:
 ```bash
 ~$ psql pg_task -c 'table pg_task'
 -[ RECORD 1 ]------------------------------------------------
-id         | cddf7de1-1194-4bee-90c6-af73d9206ce2
-step       | {"Greeter":{"ReadName":{"filename":"name.txt"}}}
-wakeup_at  | 2024-06-30 09:32:27.703599+06
-tried      | 6
-is_running | f
-error      | No such file or directory (os error 2)
-created_at | 2024-06-30 09:32:22.628563+06
-updated_at | 2024-06-30 09:32:27.703599+06
+id              | cddf7de1-1194-4bee-90c6-af73d9206ce2
+step            | {"Greeter":{"ReadName":{"filename":"name.txt"}}}
+wakeup_at       | 2024-06-30 09:32:27.703599+06
+tried           | 6
+locked_by       |
+lock_expires_at |
+error           | No such file or directory (os error 2)
+created_at      | 2024-06-30 09:32:22.628563+06
+updated_at      | 2024-06-30 09:32:27.703599+06
 ```
 
 - a non-null `error` field indicates that the task has errored and contains the
@@ -270,7 +271,7 @@ The workers would wait until the current step of all the tasks is finished and
 then exit. You can wait for this by checking for the existence of running tasks:
 
 ```sql
-SELECT EXISTS(SELECT 1 FROM pg_task WHERE is_running = true);
+SELECT EXISTS(SELECT 1 FROM pg_task WHERE locked_by IS NOT NULL);
 ```
 
 ### Delaying Steps

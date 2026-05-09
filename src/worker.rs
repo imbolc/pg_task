@@ -1,6 +1,6 @@
 use crate::{
     listener::Listener,
-    task::Task,
+    task::{Task, TaskLease},
     util::{db_error, is_connection_error, is_pool_timeout, wait_for_reconnection},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
@@ -8,8 +8,10 @@ use sqlx::postgres::PgPool;
 use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{error, info, trace, warn};
+use uuid::Uuid;
 
 const LOCKED_TASK_RECHECK_DELAY: Duration = Duration::from_millis(100);
+const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A worker for processing tasks
 pub struct Worker<T> {
@@ -17,6 +19,8 @@ pub struct Worker<T> {
     listener: Listener,
     tasks: PhantomData<T>,
     concurrency: NonZeroUsize,
+    worker_id: Uuid,
+    lease_timeout: Duration,
 }
 
 impl<S: Step<S> + 'static> Worker<S> {
@@ -28,6 +32,8 @@ impl<S: Step<S> + 'static> Worker<S> {
             db,
             listener,
             concurrency,
+            worker_id: Uuid::new_v4(),
+            lease_timeout: DEFAULT_LEASE_TIMEOUT,
             tasks: PhantomData,
         }
     }
@@ -35,6 +41,15 @@ impl<S: Step<S> + 'static> Worker<S> {
     /// Sets the number of concurrent tasks, default is the number of CPU cores
     pub fn with_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
         self.concurrency = concurrency;
+        self
+    }
+
+    /// Sets the task lease timeout.
+    ///
+    /// If a worker cannot renew this lease before it expires, another worker
+    /// may reclaim the task.
+    pub fn with_lease_timeout(mut self, lease_timeout: Duration) -> Self {
+        self.lease_timeout = lease_timeout;
         self
     }
 
@@ -46,7 +61,7 @@ impl<S: Step<S> + 'static> Worker<S> {
 
         let result = loop {
             match self.recv_task().await {
-                Ok(Some((task, step))) => {
+                Ok(Some((task, step, lease))) => {
                     let permit = semaphore
                         .clone()
                         .acquire_owned()
@@ -54,7 +69,7 @@ impl<S: Step<S> + 'static> Worker<S> {
                         .map_err(Error::UnreachableWorkerSemaphoreClosed)?;
                     let db = self.db.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = task.run_step(&db, step).await {
+                        if let Err(e) = task.run_step(&db, step, lease).await {
                             error!("[{}] {}", task.id, source_chain::to_string(&e));
                         };
                         drop(permit);
@@ -75,7 +90,7 @@ impl<S: Step<S> + 'static> Worker<S> {
 
     /// Waits until the next task is ready, marks it running and returns it.
     /// Returns `None` if the worker is stopped
-    async fn recv_task(&self) -> Result<Option<(Task, S)>> {
+    async fn recv_task(&self) -> Result<Option<(Task, S, TaskLease)>> {
         trace!("Receiving the next task");
 
         loop {
@@ -91,11 +106,12 @@ impl<S: Step<S> + 'static> Worker<S> {
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
             let Some(task) = Task::fetch_ready(&mut tx).await? else {
-                let next_wakeup_at = Task::fetch_next_wakeup_at(&mut tx).await?;
+                let next_available_at = Task::fetch_next_available_at(&mut tx).await?;
                 tx.commit().await.map_err(db_error!("no ready tasks"))?;
 
-                if let Some(wakeup_at) = next_wakeup_at {
-                    let delay = Task::delay_until(wakeup_at).unwrap_or(LOCKED_TASK_RECHECK_DELAY);
+                if let Some(available_at) = next_available_at {
+                    let delay =
+                        Task::delay_until(available_at).unwrap_or(LOCKED_TASK_RECHECK_DELAY);
                     table_changes.wait_for(delay).await;
                 } else {
                     table_changes.wait_forever().await;
@@ -103,12 +119,13 @@ impl<S: Step<S> + 'static> Worker<S> {
                 continue;
             };
 
-            let Some(step) = task.claim(&mut tx).await? else {
+            let lease = TaskLease::new(self.worker_id, self.lease_timeout);
+            let Some(step) = task.claim(&mut tx, lease).await? else {
                 tx.commit().await.map_err(db_error!("save error"))?;
                 continue;
             };
             tx.commit().await.map_err(db_error!("mark running"))?;
-            return Ok(Some((task, step)));
+            return Ok(Some((task, step, lease)));
         }
     }
 
@@ -173,7 +190,7 @@ mod tests {
     use super::Worker;
     use crate::{Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
-    use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
+    use sqlx::{postgres::PgPoolOptions, PgPool};
     use std::{
         collections::HashMap,
         io,
@@ -188,6 +205,7 @@ mod tests {
         sync::{Notify, Semaphore},
         time::{sleep, timeout},
     };
+    use uuid::Uuid;
 
     fn init_tracing() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -419,18 +437,27 @@ mod tests {
         pool: &PgPool,
         step: &str,
         wakeup_at: chrono::DateTime<Utc>,
-        is_running: bool,
+        is_leased: bool,
         error: Option<&str>,
     ) -> Uuid {
+        let (locked_by, lock_expires_at) = if is_leased {
+            (
+                Some(Uuid::from_u128(1)),
+                Some(Utc::now() + ChronoDuration::seconds(60)),
+            )
+        } else {
+            (None, None)
+        };
         sqlx::query!(
             "
-            INSERT INTO pg_task (step, wakeup_at, is_running, error)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO pg_task (step, wakeup_at, locked_by, lock_expires_at, error)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             ",
             step,
             wakeup_at,
-            is_running,
+            locked_by,
+            lock_expires_at,
             error,
         )
         .fetch_one(pool)
@@ -443,26 +470,43 @@ mod tests {
         pool: &PgPool,
         step: &TestTask,
         wakeup_at: chrono::DateTime<Utc>,
-        is_running: bool,
+        is_leased: bool,
     ) -> Uuid {
         insert_raw_task(
             pool,
             &serde_json::to_string(step).unwrap(),
             wakeup_at,
-            is_running,
+            is_leased,
             None,
         )
         .await
     }
 
-    async fn insert_task(pool: &PgPool, step: &TestTask, is_running: bool) {
+    async fn insert_task(pool: &PgPool, step: &TestTask, is_leased: bool) {
         insert_task_at(
             pool,
             step,
             Utc::now() - ChronoDuration::milliseconds(1),
-            is_running,
+            is_leased,
         )
         .await;
+    }
+
+    async fn set_task_lease(pool: &PgPool, id: Uuid, lock_expires_at: chrono::DateTime<Utc>) {
+        sqlx::query!(
+            r#"
+            UPDATE pg_task
+            SET locked_by = $2,
+                lock_expires_at = $3
+            WHERE id = $1
+            "#,
+            id,
+            Uuid::from_u128(1),
+            lock_expires_at,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn connect_to_current_db(
@@ -663,7 +707,34 @@ mod tests {
 
         tx.rollback().await.unwrap();
 
-        let (task, step) = timeout(Duration::from_secs(1), recv)
+        let (task, step, _lease) = timeout(Duration::from_secs(1), recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, id);
+        assert!(matches!(step, TestTask::Noop(Noop)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_rechecks_leased_tasks_when_their_lease_expires(pool: PgPool) {
+        let id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            true,
+        )
+        .await;
+        set_task_lease(&pool, id, Utc::now() + ChronoDuration::milliseconds(100)).await;
+
+        let worker = Worker::<TestTask>::new(pool);
+        let recv = tokio::spawn(async move { worker.recv_task().await });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!recv.is_finished());
+
+        let (task, step, _lease) = timeout(Duration::from_secs(1), recv)
             .await
             .unwrap()
             .unwrap()
@@ -695,18 +766,19 @@ mod tests {
         let first_recv = tokio::spawn(async move { first_worker.recv_task().await });
         let second_recv = tokio::spawn(async move { second_worker.recv_task().await });
 
-        let (first_task, first_step) = timeout(Duration::from_secs(1), first_recv)
+        let (first_task, first_step, _first_lease) = timeout(Duration::from_secs(1), first_recv)
             .await
             .unwrap()
             .unwrap()
             .unwrap()
             .unwrap();
-        let (second_task, second_step) = timeout(Duration::from_secs(1), second_recv)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let (second_task, second_step, _second_lease) =
+            timeout(Duration::from_secs(1), second_recv)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
 
         assert!(matches!(first_step, TestTask::Noop(Noop)));
         assert!(matches!(second_step, TestTask::Noop(Noop)));
@@ -714,7 +786,7 @@ mod tests {
         assert!([first_id, second_id].contains(&first_task.id));
         assert!([first_id, second_id].contains(&second_task.id));
 
-        let running = sqlx::query!("SELECT id FROM pg_task WHERE is_running = true")
+        let running = sqlx::query!("SELECT id FROM pg_task WHERE locked_by IS NOT NULL")
             .fetch_all(&pool)
             .await
             .unwrap();
@@ -1009,7 +1081,7 @@ mod tests {
             .unwrap();
 
         let invalid_row = sqlx::query!(
-            "SELECT tried, is_running, error FROM pg_task WHERE id = $1",
+            "SELECT tried, locked_by, lock_expires_at, error FROM pg_task WHERE id = $1",
             invalid_id,
         )
         .fetch_one(&pool)
@@ -1018,7 +1090,8 @@ mod tests {
 
         assert_eq!(state.state().events(), vec!["complete"]);
         assert_eq!(invalid_row.tried, 0);
-        assert!(!invalid_row.is_running);
+        assert!(invalid_row.locked_by.is_none());
+        assert!(invalid_row.lock_expires_at.is_none());
         assert!(invalid_row.error.is_some());
         assert_eq!(task_count(&pool).await, 1);
     }

@@ -6,17 +6,36 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{
     postgres::{PgConnection, PgPool},
-    types::Uuid,
     PgExecutor,
 };
 use std::{fmt, time::Duration};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct Task {
     pub id: Uuid,
     step: String,
     tried: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TaskLease {
+    worker_id: Uuid,
+    timeout: chrono::Duration,
+}
+
+impl TaskLease {
+    pub(crate) fn new(worker_id: Uuid, timeout: Duration) -> Self {
+        Self {
+            worker_id,
+            timeout: std_duration_to_chrono(timeout),
+        }
+    }
+
+    fn expires_at(self) -> DateTime<Utc> {
+        Utc::now() + self.timeout
+    }
 }
 
 impl Task {
@@ -30,7 +49,7 @@ impl Task {
         }
     }
 
-    /// Fetches the closest ready unlocked task to run.
+    /// Fetches the closest ready task to run.
     pub async fn fetch_ready(con: &mut PgConnection) -> Result<Option<Self>> {
         trace!("Fetching the closest ready task to run");
         sqlx::query_as!(
@@ -41,9 +60,9 @@ impl Task {
                 step,
                 tried
             FROM pg_task
-            WHERE is_running = false
-              AND error IS NULL
+            WHERE error IS NULL
               AND wakeup_at <= now()
+              AND (locked_by IS NULL OR lock_expires_at <= now())
             ORDER BY wakeup_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -54,16 +73,21 @@ impl Task {
         .map_err(db_error!())
     }
 
-    /// Fetches the closest scheduled task time.
-    pub async fn fetch_next_wakeup_at(con: &mut PgConnection) -> Result<Option<DateTime<Utc>>> {
-        trace!("Fetching the closest scheduled task time");
+    /// Fetches the closest time when a task may become claimable.
+    pub async fn fetch_next_available_at(con: &mut PgConnection) -> Result<Option<DateTime<Utc>>> {
+        trace!("Fetching the closest task availability time");
         sqlx::query_scalar!(
             r#"
-            SELECT wakeup_at
+            SELECT
+                CASE
+                    WHEN locked_by IS NOT NULL THEN
+                        GREATEST(wakeup_at, lock_expires_at)
+                    ELSE
+                        wakeup_at
+                END AS "next_at!"
             FROM pg_task
-            WHERE is_running = false
-              AND error IS NULL
-            ORDER BY wakeup_at
+            WHERE error IS NULL
+            ORDER BY 1
             LIMIT 1
             "#,
         )
@@ -73,11 +97,22 @@ impl Task {
     }
 
     /// Marks the task running
-    pub async fn mark_running(&self, con: &mut PgConnection) -> Result<()> {
+    pub(crate) async fn mark_running(
+        &self,
+        con: &mut PgConnection,
+        lease: TaskLease,
+    ) -> Result<()> {
         trace!("[{}] mark running", self.id);
         sqlx::query!(
-            "UPDATE pg_task SET is_running = true WHERE id = $1",
-            self.id
+            r#"
+            UPDATE pg_task
+            SET locked_by = $2,
+                lock_expires_at = $3
+            WHERE id = $1
+            "#,
+            self.id,
+            lease.worker_id,
+            lease.expires_at(),
         )
         .execute(con)
         .await
@@ -88,21 +123,30 @@ impl Task {
     /// Deserializes the current task step and marks it running.
     /// If deserialization fails, stores the error instead and leaves the task
     /// non-running.
-    pub(crate) async fn claim<S: Step<S>>(&self, con: &mut PgConnection) -> Result<Option<S>> {
+    pub(crate) async fn claim<S: Step<S>>(
+        &self,
+        con: &mut PgConnection,
+        lease: TaskLease,
+    ) -> Result<Option<S>> {
         let step = match self.parse_step() {
             Ok(step) => step,
             Err(e) => {
-                self.save_error(&mut *con, e.into(), false).await?;
+                self.save_claim_error(&mut *con, e.into()).await?;
                 return Ok(None);
             }
         };
 
-        self.mark_running(con).await?;
+        self.mark_running(con, lease).await?;
         Ok(Some(step))
     }
 
     /// Runs the current step of the task to completion
-    pub async fn run_step<S: Step<S>>(&self, db: &PgPool, step: S) -> Result<()> {
+    pub(crate) async fn run_step<S: Step<S>>(
+        &self,
+        db: &PgPool,
+        step: S,
+        lease: TaskLease,
+    ) -> Result<()> {
         info!(
             "[{id}]{attempt} run step {step}",
             id = self.id,
@@ -118,15 +162,19 @@ impl Task {
         match step.step(db).await {
             Err(e) => {
                 if self.tried < retry_limit {
-                    self.retry(db, self.tried, retry_limit, retry_delay, e)
+                    self.retry(db, self.tried, retry_limit, retry_delay, e, lease)
                         .await?;
                 } else {
-                    self.save_error(db, e, true).await?;
+                    self.save_step_error(db, e, true, lease).await?;
                 }
             }
-            Ok(NextStep::None) => self.complete(db).await?,
-            Ok(NextStep::Now(step)) => self.save_next_step(db, step, Duration::ZERO).await?,
-            Ok(NextStep::Delayed(step, delay)) => self.save_next_step(db, step, delay).await?,
+            Ok(NextStep::None) => self.complete(db, lease).await?,
+            Ok(NextStep::Now(step)) => {
+                self.save_next_step(db, step, Duration::ZERO, lease).await?;
+            }
+            Ok(NextStep::Delayed(step, delay)) => {
+                self.save_next_step(db, step, delay, lease).await?;
+            }
         };
         Ok(())
     }
@@ -136,43 +184,88 @@ impl Task {
             .map_err(|e| Error::DeserializeStep(e, self.step.to_string()))
     }
 
-    /// Saves the task error
-    async fn save_error<'e, E>(&self, db: E, err: StepError, increment_tried: bool) -> Result<()>
+    /// Saves a deserialization error for a task before the worker owns it.
+    async fn save_claim_error<'e, E>(&self, db: E, err: StepError) -> Result<()>
     where
         E: PgExecutor<'e>,
     {
         let err_str = source_chain::to_string(&*err);
-        let tried_increment = if increment_tried { 1 } else { 0 };
         let step = sqlx::query!(
             r#"
             UPDATE pg_task
-            SET is_running = false,
-                tried = tried + $3,
-                error = $2,
-                wakeup_at = now()
+            SET error = $2,
+                wakeup_at = now(),
+                locked_by = NULL,
+                lock_expires_at = NULL
             WHERE id = $1
             RETURNING step::TEXT as "step!"
             "#,
             self.id,
             &err_str,
-            tried_increment,
         )
         .fetch_one(db)
         .await
         .map(|r| r.step)
         .map_err(db_error!())?;
 
+        error!(
+            "[{id}] couldn't deserialize step {step}: {err_str}",
+            id = self.id
+        );
+
+        Ok(())
+    }
+
+    /// Saves the task error if the worker still owns the task.
+    async fn save_step_error(
+        &self,
+        db: &PgPool,
+        err: StepError,
+        increment_tried: bool,
+        lease: TaskLease,
+    ) -> Result<()> {
+        let err_str = source_chain::to_string(&*err);
+        let tried_increment = if increment_tried { 1 } else { 0 };
+        let step = sqlx::query!(
+            r#"
+            UPDATE pg_task
+            SET tried = tried + $3,
+                error = $2,
+                wakeup_at = now(),
+                locked_by = NULL,
+                lock_expires_at = NULL
+            WHERE id = $1
+              AND locked_by = $4
+              AND lock_expires_at > now()
+            RETURNING step::TEXT as "step!"
+            "#,
+            self.id,
+            &err_str,
+            tried_increment,
+            lease.worker_id,
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(db_error!())?;
+
+        let Some(row) = step else {
+            self.log_lost_lease(lease.worker_id, "save the step error");
+            return Ok(());
+        };
+
         if increment_tried {
             let attempt = self.tried + 1;
             error!(
                 "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
                 id = self.id,
+                step = row.step,
                 attempt = ordinal(attempt)
             );
         } else {
             error!(
                 "[{id}] couldn't deserialize step {step}: {err_str}",
-                id = self.id
+                id = self.id,
+                step = row.step
             );
         }
 
@@ -185,41 +278,62 @@ impl Task {
         db: &PgPool,
         step: impl Serialize + fmt::Debug,
         delay: Duration,
+        lease: TaskLease,
     ) -> Result<()> {
         let step = match serde_json::to_string(&step)
             .map_err(|e| Error::SerializeStep(e, format!("{step:?}")))
         {
             Ok(x) => x,
-            Err(e) => return self.save_error(db, e.into(), true).await,
+            Err(e) => return self.save_step_error(db, e.into(), true, lease).await,
         };
         debug!("[{}] moved to the next step {step}", self.id);
 
-        sqlx::query!(
+        let result = sqlx::query!(
             "
             UPDATE pg_task
-            SET is_running = false,
-                tried = 0,
+            SET tried = 0,
                 step = $2,
-                wakeup_at = $3
+                wakeup_at = $3,
+                locked_by = NULL,
+                lock_expires_at = NULL
             WHERE id = $1
+              AND locked_by = $4
+              AND lock_expires_at > now()
             ",
             self.id,
             step,
             Utc::now() + std_duration_to_chrono(delay),
+            lease.worker_id,
         )
         .execute(db)
         .await
         .map_err(db_error!())?;
+        if result.rows_affected() == 0 {
+            self.log_lost_lease(lease.worker_id, "save the next step");
+        }
         Ok(())
     }
 
     /// Removes the finished task
-    async fn complete(&self, db: &PgPool) -> Result<()> {
-        info!("[{}] is successfully completed", self.id);
-        sqlx::query!("DELETE FROM pg_task WHERE id = $1", self.id)
-            .execute(db)
-            .await
-            .map_err(db_error!())?;
+    async fn complete(&self, db: &PgPool, lease: TaskLease) -> Result<()> {
+        let result = sqlx::query!(
+            r#"
+            DELETE FROM pg_task
+            WHERE id = $1
+              AND locked_by = $2
+              AND lock_expires_at > now()
+            "#,
+            self.id,
+            lease.worker_id,
+        )
+        .execute(db)
+        .await
+        .map_err(db_error!())?;
+        if result.rows_affected() == 0 {
+            self.log_lost_lease(lease.worker_id, "complete the task");
+        } else {
+            info!("[{}] is successfully completed", self.id);
+        }
         Ok(())
     }
 
@@ -231,6 +345,7 @@ impl Task {
         retry_limit: i32,
         delay: Duration,
         err: StepError,
+        lease: TaskLease,
     ) -> Result<()> {
         let delay = std_duration_to_chrono(delay);
         debug!(
@@ -240,32 +355,47 @@ impl Task {
             err = source_chain::to_string(&*err),
         );
 
-        sqlx::query!(
+        let result = sqlx::query!(
             "
             UPDATE pg_task
-            SET is_running = false,
-                tried = tried + 1,
-                wakeup_at = $2
+            SET tried = tried + 1,
+                wakeup_at = $2,
+                locked_by = NULL,
+                lock_expires_at = NULL
             WHERE id = $1
+              AND locked_by = $3
+              AND lock_expires_at > now()
             ",
             self.id,
             Utc::now() + delay,
+            lease.worker_id,
         )
         .execute(db)
         .await
         .map_err(db_error!())?;
+        if result.rows_affected() == 0 {
+            self.log_lost_lease(lease.worker_id, "schedule a retry");
+        }
 
         Ok(())
+    }
+
+    fn log_lost_lease(&self, worker_id: Uuid, action: &str) {
+        warn!(
+            "[{}] couldn't {action} because worker {worker_id} no longer owns the task",
+            self.id
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Task;
+    use super::{Task, TaskLease};
     use crate::{NextStep, Step};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use sqlx::{types::Uuid, PgPool};
+    use sqlx::PgPool;
     use std::{io, time::Duration};
+    use uuid::Uuid;
 
     fn init_tracing() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -399,7 +529,8 @@ mod tests {
         step: String,
         wakeup_at: DateTime<Utc>,
         tried: i32,
-        is_running: bool,
+        locked_by: Option<Uuid>,
+        lock_expires_at: Option<DateTime<Utc>>,
         error: Option<String>,
     }
 
@@ -427,24 +558,45 @@ mod tests {
         assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
     }
 
+    fn worker_id() -> Uuid {
+        Uuid::from_u128(1)
+    }
+
+    fn other_worker_id() -> Uuid {
+        Uuid::from_u128(2)
+    }
+
+    fn task_lease() -> TaskLease {
+        TaskLease::new(worker_id(), Duration::from_secs(60))
+    }
+
     async fn insert_task_row(
         pool: &PgPool,
         step: &str,
         wakeup_at: DateTime<Utc>,
         tried: i32,
-        is_running: bool,
+        is_leased: bool,
         error: Option<&str>,
     ) -> Uuid {
+        let (locked_by, lock_expires_at) = if is_leased {
+            (
+                Some(other_worker_id()),
+                Some(Utc::now() + ChronoDuration::seconds(60)),
+            )
+        } else {
+            (None, None)
+        };
         sqlx::query!(
             "
-            INSERT INTO pg_task (step, wakeup_at, tried, is_running, error)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO pg_task (step, wakeup_at, tried, locked_by, lock_expires_at, error)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
             ",
             step,
             wakeup_at,
             tried,
-            is_running,
+            locked_by,
+            lock_expires_at,
             error,
         )
         .fetch_one(pool)
@@ -453,33 +605,60 @@ mod tests {
         .id
     }
 
-    async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
+    async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_leased: bool) -> Uuid {
         let step = serialized_step(step);
         insert_task_row(
             pool,
             &step,
             Utc::now() - ChronoDuration::milliseconds(1),
             tried,
-            is_running,
+            is_leased,
             None,
         )
         .await
     }
 
-    async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask) {
+    async fn set_task_lease(
+        pool: &PgPool,
+        id: Uuid,
+        worker_id: Uuid,
+        lock_expires_at: DateTime<Utc>,
+    ) {
+        sqlx::query!(
+            r#"
+            UPDATE pg_task
+            SET locked_by = $2,
+                lock_expires_at = $3
+            WHERE id = $1
+            "#,
+            id,
+            worker_id,
+            lock_expires_at,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask, TaskLease) {
         let id = insert_task(pool, &step, tried, false).await;
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
         assert_eq!(task.id, id);
-        let claimed = task.claim::<TestTask>(&mut tx).await.unwrap().unwrap();
+        let lease = task_lease();
+        let claimed = task
+            .claim::<TestTask>(&mut tx, lease)
+            .await
+            .unwrap()
+            .unwrap();
         tx.commit().await.unwrap();
-        (task, claimed)
+        (task, claimed, lease)
     }
 
     async fn fetch_task_row(pool: &PgPool, id: Uuid) -> Option<TaskRow> {
         sqlx::query!(
             "
-            SELECT step, wakeup_at, tried, is_running, error
+            SELECT step, wakeup_at, tried, locked_by, lock_expires_at, error
             FROM pg_task
             WHERE id = $1
             ",
@@ -492,7 +671,8 @@ mod tests {
             step: row.step,
             wakeup_at: row.wakeup_at,
             tried: row.tried,
-            is_running: row.is_running,
+            locked_by: row.locked_by,
+            lock_expires_at: row.lock_expires_at,
             error: row.error,
         })
     }
@@ -526,17 +706,23 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
 
-        assert!(task.claim::<TestTask>(&mut tx).await.unwrap().is_none());
+        assert!(task
+            .claim::<TestTask>(&mut tx, task_lease())
+            .await
+            .unwrap()
+            .is_none());
 
         tx.commit().await.unwrap();
 
-        let row = sqlx::query!("SELECT tried, is_running, error FROM pg_task LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row =
+            sqlx::query!("SELECT tried, locked_by, lock_expires_at, error FROM pg_task LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         assert_eq!(row.tried, 0);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row.error.is_some());
     }
 
@@ -588,13 +774,13 @@ mod tests {
     async fn mark_running_returns_db_errors_for_update_failures(pool: PgPool) {
         let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
         let task = task_with_step(id, &TestTask::Valid(Valid), 0);
-        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN is_running TO running_state")
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN locked_by TO task_locked_by")
             .execute(&pool)
             .await
             .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let err = task.mark_running(&mut tx).await.unwrap_err();
+        let err = task.mark_running(&mut tx, task_lease()).await.unwrap_err();
 
         assert_database_error(err);
     }
@@ -609,43 +795,60 @@ mod tests {
             .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let err = task.claim::<TestTask>(&mut tx).await.unwrap_err();
+        let err = task
+            .claim::<TestTask>(&mut tx, task_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn claim_marks_valid_steps_running(pool: PgPool) {
+    async fn claim_marks_valid_steps_leased(pool: PgPool) {
         let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
 
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
-        let claimed = task.claim::<TestTask>(&mut tx).await.unwrap();
+        let started_at = Utc::now();
+        let claimed = task.claim::<TestTask>(&mut tx, task_lease()).await.unwrap();
         tx.commit().await.unwrap();
+        let finished_at = Utc::now();
 
         assert!(matches!(claimed, Some(TestTask::Valid(Valid))));
 
         let row = fetch_task_row(&pool, id).await.unwrap();
         assert_eq!(row.step, serialized_step(&TestTask::Valid(Valid)));
         assert_eq!(row.tried, 0);
-        assert!(row.is_running);
+        assert_eq!(row.locked_by, Some(worker_id()));
+        assert_timestamp_between(
+            row.lock_expires_at.unwrap(),
+            started_at + ChronoDuration::seconds(60),
+            finished_at + ChronoDuration::seconds(61),
+        );
         assert!(row.error.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn fetch_ready_ignores_running_errored_and_future_tasks_and_picks_the_earliest_ready_one(
+    async fn fetch_ready_ignores_leased_errored_and_future_tasks_and_picks_the_earliest_ready_one(
         pool: PgPool,
     ) {
         let now = Utc::now();
         let valid = serialized_step(&TestTask::Valid(Valid));
 
-        insert_task_row(
+        let live_lease = insert_task_row(
             &pool,
             &valid,
             now - ChronoDuration::seconds(3),
             0,
             true,
             None,
+        )
+        .await;
+        set_task_lease(
+            &pool,
+            live_lease,
+            other_worker_id(),
+            now + ChronoDuration::seconds(60),
         )
         .await;
         insert_task_row(
@@ -686,16 +889,51 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn fetch_next_wakeup_at_returns_the_earliest_visible_eligible_task(pool: PgPool) {
+    async fn fetch_ready_returns_expired_leased_tasks(pool: PgPool) {
         let now = Utc::now();
         let valid = serialized_step(&TestTask::Valid(Valid));
-        insert_task_row(
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            true,
+            None,
+        )
+        .await;
+        set_task_lease(
+            &pool,
+            expected,
+            other_worker_id(),
+            now - ChronoDuration::seconds(1),
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(task.id, expected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_available_at_returns_the_earliest_visible_eligible_task(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        let live_lease = insert_task_row(
             &pool,
             &valid,
             now - ChronoDuration::seconds(3),
             0,
             true,
             None,
+        )
+        .await;
+        set_task_lease(
+            &pool,
+            live_lease,
+            other_worker_id(),
+            now + ChronoDuration::seconds(2),
         )
         .await;
         insert_task_row(
@@ -727,7 +965,10 @@ mod tests {
         .await;
 
         let mut tx = pool.begin().await.unwrap();
-        let wakeup_at = Task::fetch_next_wakeup_at(&mut tx).await.unwrap().unwrap();
+        let wakeup_at = Task::fetch_next_available_at(&mut tx)
+            .await
+            .unwrap()
+            .unwrap();
         tx.commit().await.unwrap();
 
         let row = fetch_task_row(&pool, expected).await.unwrap();
@@ -737,11 +978,30 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_completes_tasks(pool: PgPool) {
         init_tracing();
-        let (task, step) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
+        let (task, step, lease) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         assert!(fetch_task_row(&pool, task.id).await.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_does_not_complete_tasks_after_losing_the_lease(pool: PgPool) {
+        init_tracing();
+        let (task, step, lease) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
+        set_task_lease(
+            &pool,
+            task.id,
+            other_worker_id(),
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .await;
+
+        task.run_step(&pool, step, lease).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.locked_by, Some(other_worker_id()));
+        assert!(row.error.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -754,18 +1014,18 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step).await.unwrap_err();
+        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
 
         assert_database_error(err);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_saves_immediate_next_step_and_resets_retries(pool: PgPool) {
-        let (task, step) =
+        let (task, step, lease) =
             claim_task(&pool, TestTask::AdvanceNow(AdvanceNow { value: 41 }), 2).await;
         let started_at = Utc::now();
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         let finished_at = Utc::now();
         let row = fetch_task_row(&pool, task.id).await.unwrap();
@@ -774,7 +1034,8 @@ mod tests {
             serialized_step(&TestTask::Followup(Followup { value: 42 })),
         );
         assert_eq!(row.tried, 0);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row.error.is_none());
         assert_timestamp_between(
             row.wakeup_at,
@@ -786,7 +1047,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_saves_delayed_next_step_and_resets_retries(pool: PgPool) {
         let delay = Duration::from_millis(250);
-        let (task, step) = claim_task(
+        let (task, step, lease) = claim_task(
             &pool,
             TestTask::AdvanceLater(AdvanceLater {
                 value: 9,
@@ -797,7 +1058,7 @@ mod tests {
         .await;
         let started_at = Utc::now();
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         let finished_at = Utc::now();
         let row = fetch_task_row(&pool, task.id).await.unwrap();
@@ -807,7 +1068,8 @@ mod tests {
             serialized_step(&TestTask::Followup(Followup { value: 10 })),
         );
         assert_eq!(row.tried, 0);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row.error.is_none());
         assert_timestamp_between(
             row.wakeup_at,
@@ -826,7 +1088,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step).await.unwrap_err();
+        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
 
         assert_database_error(err);
     }
@@ -835,17 +1097,18 @@ mod tests {
     async fn run_step_schedules_retries_before_the_retry_limit(pool: PgPool) {
         init_tracing();
         let retry_delay = <RetryFail as Step<TestTask>>::RETRY_DELAY;
-        let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
+        let (task, step, lease) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
         let started_at = Utc::now();
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         let finished_at = Utc::now();
         let row = fetch_task_row(&pool, task.id).await.unwrap();
         let retry_delay = ChronoDuration::from_std(retry_delay).unwrap();
         assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
         assert_eq!(row.tried, 2);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row.error.is_none());
         assert_timestamp_between(
             row.wakeup_at,
@@ -864,7 +1127,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step).await.unwrap_err();
+        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
 
         assert_database_error(err);
     }
@@ -873,16 +1136,18 @@ mod tests {
     async fn run_step_saves_terminal_errors_after_retry_limit(pool: PgPool) {
         init_tracing();
         let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
-        let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), retry_limit).await;
+        let (task, step, lease) =
+            claim_task(&pool, TestTask::RetryFail(RetryFail), retry_limit).await;
         let started_at = Utc::now();
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         let finished_at = Utc::now();
         let row = fetch_task_row(&pool, task.id).await.unwrap();
         assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
         assert_eq!(row.tried, retry_limit + 1);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row
             .error
             .as_deref()
@@ -905,21 +1170,22 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step).await.unwrap_err();
+        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
 
         assert_database_error(err);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_step_saves_next_step_serialization_failures_as_errors(pool: PgPool) {
-        let (task, step) = claim_task(&pool, TestTask::BrokenNext(BrokenNext), 0).await;
+        let (task, step, lease) = claim_task(&pool, TestTask::BrokenNext(BrokenNext), 0).await;
 
-        task.run_step(&pool, step).await.unwrap();
+        task.run_step(&pool, step, lease).await.unwrap();
 
         let row = fetch_task_row(&pool, task.id).await.unwrap();
         assert_eq!(row.step, serialized_step(&TestTask::BrokenNext(BrokenNext)),);
         assert_eq!(row.tried, 1);
-        assert!(!row.is_running);
+        assert!(row.locked_by.is_none());
+        assert!(row.lock_expires_at.is_none());
         assert!(row
             .error
             .as_deref()
