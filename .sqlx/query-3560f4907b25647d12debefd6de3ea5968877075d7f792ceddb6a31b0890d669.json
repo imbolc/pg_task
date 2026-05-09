@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id,\n                step,\n                tried\n            FROM pg_task\n            WHERE is_running = false\n              AND error IS NULL\n              AND wakeup_at <= now()\n            ORDER BY wakeup_at\n            LIMIT 1\n            FOR UPDATE SKIP LOCKED\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "step",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "tried",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3560f4907b25647d12debefd6de3ea5968877075d7f792ceddb6a31b0890d669"
+}

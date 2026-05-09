@@ -9,6 +9,8 @@ use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, error, info, trace, warn};
 
+const LOCKED_TASK_RECHECK_DELAY: Duration = Duration::from_millis(100);
+
 /// A worker for processing tasks
 pub struct Worker<T> {
     db: PgPool,
@@ -107,17 +109,16 @@ impl<S: Step<S> + 'static> Worker<S> {
             let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
-            let Some(task) = Task::fetch_closest(&mut tx).await? else {
-                // No tasks, waiting for the tasks table changes
-                tx.commit().await.map_err(db_error!("no tasks"))?;
-                table_changes.wait_forever().await;
-                continue;
-            };
+            let Some(task) = Task::fetch_ready(&mut tx).await? else {
+                let next_wakeup_at = Task::fetch_next_wakeup_at(&mut tx).await?;
+                tx.commit().await.map_err(db_error!("no ready tasks"))?;
 
-            if let Some(delay) = task.wait_before_running() {
-                // Waiting until a task is ready or until the listener wakes us.
-                tx.commit().await.map_err(db_error!("wait"))?;
-                table_changes.wait_for(delay).await;
+                if let Some(wakeup_at) = next_wakeup_at {
+                    let delay = Task::delay_until(wakeup_at).unwrap_or(LOCKED_TASK_RECHECK_DELAY);
+                    table_changes.wait_for(delay).await;
+                } else {
+                    table_changes.wait_forever().await;
+                }
                 continue;
             };
 
@@ -474,7 +475,13 @@ mod tests {
     }
 
     async fn insert_task(pool: &PgPool, step: &TestTask, is_running: bool) {
-        insert_task_at(pool, step, Utc::now(), is_running).await;
+        insert_task_at(
+            pool,
+            step,
+            Utc::now() - ChronoDuration::milliseconds(1),
+            is_running,
+        )
+        .await;
     }
 
     async fn connect_to_current_db(
@@ -664,6 +671,88 @@ mod tests {
             }
             _ => panic!("expected a pool-closed begin error"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_rechecks_locked_ready_tasks_without_notifications(pool: PgPool) {
+        let id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let mut tx = pool.begin().await.unwrap();
+        let locked = sqlx::query!("SELECT id FROM pg_task WHERE id = $1 FOR UPDATE", id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(locked.id, id);
+
+        let worker = Worker::<TestTask>::new(pool);
+        let recv = tokio::spawn(async move { worker.recv_task().await });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!recv.is_finished());
+
+        tx.rollback().await.unwrap();
+
+        let (task, step) = timeout(Duration::from_secs(1), recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, id);
+        assert!(matches!(step, TestTask::Noop(Noop)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn two_workers_claim_ready_tasks_once(pool: PgPool) {
+        let first_id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let second_id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let first_worker = Worker::<TestTask>::new(pool.clone());
+        let second_worker = Worker::<TestTask>::new(pool.clone());
+
+        let first_recv = tokio::spawn(async move { first_worker.recv_task().await });
+        let second_recv = tokio::spawn(async move { second_worker.recv_task().await });
+
+        let (first_task, first_step) = timeout(Duration::from_secs(1), first_recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (second_task, second_step) = timeout(Duration::from_secs(1), second_recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(first_step, TestTask::Noop(Noop)));
+        assert!(matches!(second_step, TestTask::Noop(Noop)));
+        assert_ne!(first_task.id, second_task.id);
+        assert!([first_id, second_id].contains(&first_task.id));
+        assert!([first_id, second_id].contains(&second_task.id));
+
+        let running = sqlx::query!("SELECT id FROM pg_task WHERE is_running = true")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 2);
     }
 
     #[tokio::test]

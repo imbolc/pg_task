@@ -17,13 +17,12 @@ pub struct Task {
     pub id: Uuid,
     step: String,
     tried: i32,
-    pub wakeup_at: DateTime<Utc>,
 }
 
 impl Task {
-    /// Returns a delay before running the task
-    pub fn wait_before_running(&self) -> Option<Duration> {
-        let delay = self.wakeup_at - Utc::now();
+    /// Returns a delay before a task should run at the given time.
+    pub fn delay_until(wakeup_at: DateTime<Utc>) -> Option<Duration> {
+        let delay = wakeup_at - Utc::now();
         if delay <= chrono::Duration::zero() {
             None
         } else {
@@ -31,23 +30,41 @@ impl Task {
         }
     }
 
-    /// Fetches the closest task to run
-    pub async fn fetch_closest(con: &mut PgConnection) -> Result<Option<Self>> {
-        trace!("Fetching the closest task to run");
+    /// Fetches the closest ready unlocked task to run.
+    pub async fn fetch_ready(con: &mut PgConnection) -> Result<Option<Self>> {
+        trace!("Fetching the closest ready task to run");
         sqlx::query_as!(
             Task,
             r#"
             SELECT
                 id,
                 step,
-                tried,
-                wakeup_at
+                tried
+            FROM pg_task
+            WHERE is_running = false
+              AND error IS NULL
+              AND wakeup_at <= now()
+            ORDER BY wakeup_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_optional(con)
+        .await
+        .map_err(db_error!())
+    }
+
+    /// Fetches the closest scheduled task time.
+    pub async fn fetch_next_wakeup_at(con: &mut PgConnection) -> Result<Option<DateTime<Utc>>> {
+        trace!("Fetching the closest scheduled task time");
+        sqlx::query_scalar!(
+            r#"
+            SELECT wakeup_at
             FROM pg_task
             WHERE is_running = false
               AND error IS NULL
             ORDER BY wakeup_at
             LIMIT 1
-            FOR UPDATE
             "#,
         )
         .fetch_optional(con)
@@ -395,7 +412,6 @@ mod tests {
             id,
             step: serialized_step(step),
             tried,
-            wakeup_at: Utc::now(),
         }
     }
 
@@ -404,7 +420,6 @@ mod tests {
             id,
             step: step.into(),
             tried,
-            wakeup_at: Utc::now(),
         }
     }
 
@@ -440,13 +455,21 @@ mod tests {
 
     async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
         let step = serialized_step(step);
-        insert_task_row(pool, &step, Utc::now(), tried, is_running, None).await
+        insert_task_row(
+            pool,
+            &step,
+            Utc::now() - ChronoDuration::milliseconds(1),
+            tried,
+            is_running,
+            None,
+        )
+        .await
     }
 
     async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask) {
         let id = insert_task(pool, &step, tried, false).await;
         let mut tx = pool.begin().await.unwrap();
-        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
         assert_eq!(task.id, id);
         let claimed = task.claim::<TestTask>(&mut tx).await.unwrap().unwrap();
         tx.commit().await.unwrap();
@@ -501,7 +524,7 @@ mod tests {
         .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
 
         assert!(task.claim::<TestTask>(&mut tx).await.unwrap().is_none());
 
@@ -548,7 +571,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn fetch_closest_returns_db_errors_for_query_failures(pool: PgPool) {
+    async fn fetch_ready_returns_db_errors_for_query_failures(pool: PgPool) {
         insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
         sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
             .execute(&pool)
@@ -556,7 +579,7 @@ mod tests {
             .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let err = Task::fetch_closest(&mut tx).await.unwrap_err();
+        let err = Task::fetch_ready(&mut tx).await.unwrap_err();
 
         assert_database_error(err);
     }
@@ -596,7 +619,7 @@ mod tests {
         let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
 
         let mut tx = pool.begin().await.unwrap();
-        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
         let claimed = task.claim::<TestTask>(&mut tx).await.unwrap();
         tx.commit().await.unwrap();
 
@@ -610,7 +633,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn fetch_closest_ignores_running_and_errored_tasks_and_picks_the_earliest_eligible_one(
+    async fn fetch_ready_ignores_running_errored_and_future_tasks_and_picks_the_earliest_ready_one(
         pool: PgPool,
     ) {
         let now = Utc::now();
@@ -654,13 +677,61 @@ mod tests {
         .await;
 
         let mut tx = pool.begin().await.unwrap();
-        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
         tx.commit().await.unwrap();
 
         assert_eq!(task.id, expected);
         assert_eq!(task.step, valid);
         assert_eq!(task.tried, 0);
-        assert!(task.wait_before_running().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_wakeup_at_returns_the_earliest_visible_eligible_task(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(3),
+            0,
+            true,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(2),
+            0,
+            false,
+            Some("boom"),
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(2),
+            0,
+            false,
+            None,
+        )
+        .await;
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let wakeup_at = Task::fetch_next_wakeup_at(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch_task_row(&pool, expected).await.unwrap();
+        assert_eq!(wakeup_at, row.wakeup_at);
     }
 
     #[sqlx::test(migrations = "./migrations")]
