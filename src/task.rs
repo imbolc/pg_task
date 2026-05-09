@@ -711,6 +711,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delay_until_returns_none_for_ready_times() {
+        assert!(Task::delay_until(Utc::now() - ChronoDuration::milliseconds(1)).is_none());
+    }
+
+    #[test]
+    fn delay_until_returns_duration_for_future_times() {
+        let delay = Task::delay_until(Utc::now() + ChronoDuration::milliseconds(250)).unwrap();
+
+        assert!(delay <= Duration::from_millis(250));
+        assert!(delay > Duration::ZERO);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn claim_marks_invalid_steps_errored(pool: PgPool) {
         sqlx::query!(
@@ -994,6 +1007,33 @@ mod tests {
         tx.commit().await.unwrap();
 
         assert_eq!(task.id, expected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_available_at_returns_none_when_no_tasks_are_visible(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        assert!(Task::fetch_next_available_at(&mut tx)
+            .await
+            .unwrap()
+            .is_none());
+        tx.commit().await.unwrap();
+
+        insert_task_row(
+            &pool,
+            &serialized_step(&TestTask::Valid(Valid)),
+            Utc::now() - ChronoDuration::seconds(1),
+            0,
+            false,
+            Some("boom"),
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(Task::fetch_next_available_at(&mut tx)
+            .await
+            .unwrap()
+            .is_none());
+        tx.commit().await.unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]

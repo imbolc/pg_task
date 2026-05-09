@@ -412,7 +412,7 @@ impl<S: Step<S> + 'static> Worker<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::Worker;
+    use super::{HeartbeatEvent, Worker};
     use crate::{Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
     use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -427,7 +427,7 @@ mod tests {
         time::Duration,
     };
     use tokio::{
-        sync::{Notify, Semaphore},
+        sync::{mpsc, Notify, Semaphore},
         time::{sleep, timeout},
     };
     use uuid::Uuid;
@@ -829,6 +829,91 @@ mod tests {
                 .unwrap(),
         )
         .with_heartbeat_interval(Duration::ZERO);
+    }
+
+    #[test]
+    fn heartbeat_events_pause_resume_and_expire_fetching() {
+        let mut heartbeat_healthy = true;
+        Worker::<TestTask>::handle_heartbeat_event(HeartbeatEvent::Failed, &mut heartbeat_healthy)
+            .unwrap();
+        assert!(!heartbeat_healthy);
+
+        Worker::<TestTask>::handle_heartbeat_event(
+            HeartbeatEvent::Recovered,
+            &mut heartbeat_healthy,
+        )
+        .unwrap();
+        assert!(heartbeat_healthy);
+
+        let err = Worker::<TestTask>::handle_heartbeat_event(
+            HeartbeatEvent::Expired(Error::Db(sqlx::Error::PoolTimedOut, "test".into())),
+            &mut heartbeat_healthy,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expiry_interrupts_retryable_fetch_error_handling() {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        );
+        let (heartbeat_events, mut heartbeat_events_receiver) = mpsc::unbounded_channel();
+        heartbeat_events
+            .send(HeartbeatEvent::Expired(Error::Db(
+                sqlx::Error::PoolTimedOut,
+                "heartbeat".into(),
+            )))
+            .unwrap();
+        let mut heartbeat_healthy = true;
+        let mut abort_running_steps = false;
+
+        let err = timeout(
+            Duration::from_millis(100),
+            worker.handle_recv_task_error_or_heartbeat(
+                Error::Db(sqlx::Error::PoolTimedOut, "fetch".into()),
+                &mut heartbeat_events_receiver,
+                &mut heartbeat_healthy,
+                &mut abort_running_steps,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
+        assert!(abort_running_steps);
+    }
+
+    #[tokio::test]
+    async fn running_step_tracking_prunes_finished_steps() {
+        let finished_step = tokio::spawn(async {});
+        let finished_step_abort = finished_step.abort_handle();
+        finished_step.await.unwrap();
+
+        let running_step = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let running_step_abort = running_step.abort_handle();
+        let running_steps = Mutex::new(vec![finished_step_abort]);
+
+        Worker::<TestTask>::track_running_step(&running_steps, running_step_abort);
+
+        assert_eq!(
+            running_steps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+        );
+        assert!(Worker::<TestTask>::has_running_steps(&running_steps));
+
+        Worker::<TestTask>::abort_running_steps(&running_steps);
+        assert!(running_step.await.unwrap_err().is_cancelled());
+        assert!(!Worker::<TestTask>::has_running_steps(&running_steps));
     }
 
     #[sqlx::test(migrations = "./migrations")]
