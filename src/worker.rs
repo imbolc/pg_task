@@ -66,6 +66,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     /// If a worker cannot renew this lease before it expires, another worker
     /// may reclaim the task.
     pub fn with_lease_timeout(mut self, lease_timeout: Duration) -> Self {
+        assert!(!lease_timeout.is_zero(), "lease timeout must be non-zero");
         self.lease_timeout = lease_timeout;
         self
     }
@@ -808,6 +809,28 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    #[should_panic(expected = "lease timeout must be non-zero")]
+    async fn with_lease_timeout_rejects_zero() {
+        Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        )
+        .with_lease_timeout(Duration::ZERO);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "heartbeat interval must be non-zero")]
+    async fn with_heartbeat_interval_rejects_zero() {
+        Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        )
+        .with_heartbeat_interval(Duration::ZERO);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn run_returns_listener_startup_errors(pool: PgPool) {
         let worker = Worker::<TestTask>::new(pool);
@@ -1155,6 +1178,58 @@ mod tests {
             .unwrap();
 
         assert!(state.state().events().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_resumes_fetching_after_heartbeat_recovers(pool: PgPool) {
+        let worker_pool = connect_to_current_db(&pool, 2, Duration::from_millis(20)).await;
+        let held_connection = worker_pool.acquire().await.unwrap();
+        let state = StepStateGuard::new();
+
+        let worker = tokio::spawn({
+            let worker_pool = worker_pool.clone();
+            async move {
+                Worker::<TestTask>::new(worker_pool)
+                    .with_concurrency(nonzero(1))
+                    .with_lease_timeout(Duration::from_millis(300))
+                    .with_heartbeat_interval(Duration::from_millis(50))
+                    .run()
+                    .await
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+        insert_task(
+            &pool,
+            &TestTask::Complete(Complete { key: state.key() }),
+            false,
+        )
+        .await;
+        sleep(Duration::from_millis(150)).await;
+
+        assert!(state.state().events().is_empty());
+        drop(held_connection);
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if !state.state().events().is_empty() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state.state().events(), vec!["complete"]);
     }
 
     #[tokio::test]
