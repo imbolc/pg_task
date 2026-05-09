@@ -7,7 +7,7 @@ use crate::{
 use sqlx::postgres::PgPool;
 use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::sleep};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 const LOCKED_TASK_RECHECK_DELAY: Duration = Duration::from_millis(100);
 
@@ -40,7 +40,6 @@ impl<S: Step<S> + 'static> Worker<S> {
 
     /// Runs all ready tasks to completion and waits for new ones
     pub async fn run(&self) -> Result<()> {
-        self.unlock_stale_tasks().await?;
         self.listener.listen(self.db.clone()).await?;
 
         let semaphore = Arc::new(Semaphore::new(self.concurrency.get()));
@@ -72,24 +71,6 @@ impl<S: Step<S> + 'static> Worker<S> {
             }
         };
         self.finish_run(result, semaphore).await
-    }
-
-    /// Unlocks all tasks. This is intended to run at the start of the worker as
-    /// some tasks could remain locked as running indefinitely if the
-    /// previous run ended due to some kind of crash.
-    async fn unlock_stale_tasks(&self) -> Result<()> {
-        let unlocked =
-            sqlx::query!("UPDATE pg_task SET is_running = false WHERE is_running = true")
-                .execute(&self.db)
-                .await
-                .map_err(Error::UnlockStaleTasks)?
-                .rows_affected();
-        if unlocked == 0 {
-            debug!("No stale tasks to unlock")
-        } else {
-            debug!("Unlocked {} stale tasks", unlocked)
-        }
-        Ok(())
     }
 
     /// Waits until the next task is ready, marks it running and returns it.
@@ -538,21 +519,6 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn run_returns_unlock_stale_task_errors(pool: PgPool) {
-        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN is_running TO running_state")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let err = Worker::<TestTask>::new(pool).run().await.unwrap_err();
-
-        assert!(matches!(
-            err,
-            Error::UnlockStaleTasks(sqlx::Error::Database(_))
-        ));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
     async fn run_returns_listener_startup_errors(pool: PgPool) {
         let worker = Worker::<TestTask>::new(pool);
         worker.listener.fail_next_listen_for_tests();
@@ -979,27 +945,37 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn run_unlocks_stale_tasks_before_processing(pool: PgPool) {
+    async fn starting_another_worker_does_not_unlock_live_tasks(pool: PgPool) {
         let state = StepStateGuard::new();
         insert_task(
             &pool,
-            &TestTask::Complete(Complete { key: state.key() }),
-            true,
+            &TestTask::Blocking(Blocking { key: state.key() }),
+            false,
         )
         .await;
 
-        let worker = spawn_worker(pool.clone());
-
+        let first_worker = spawn_worker(pool.clone());
         state.state().wait_for_events(1).await;
-        stop_worker(&pool).await;
 
-        timeout(Duration::from_secs(1), worker)
+        let second_worker = spawn_worker(pool.clone());
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.state().events(), vec!["started"]);
+
+        stop_worker(&pool).await;
+        state.state().release();
+
+        timeout(Duration::from_secs(1), first_worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), second_worker)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
 
-        assert_eq!(state.state().events(), vec!["complete"]);
+        assert_eq!(state.state().events(), vec!["started", "completed"]);
         assert_eq!(task_count(&pool).await, 0);
     }
 

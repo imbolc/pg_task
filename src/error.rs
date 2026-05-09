@@ -13,8 +13,6 @@ pub enum Error {
     scheduling and running of the step): {1}
     */
     DeserializeStep(#[source] serde_json::Error, String),
-    /// can't unlock stale tasks
-    UnlockStaleTasks(#[source] sqlx::Error),
     /// listener can't connect to the db
     ListenerConnect(#[source] sqlx::Error),
     /// can't start listening for table changes
