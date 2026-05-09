@@ -112,6 +112,19 @@ mod tests {
         assert_scheduler::<MacroScheduler>();
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scheduler_macro_schedules_wrapped_tasks(pool: PgPool) {
+        let task = MacroScheduler::MacroTask(MacroTask::First(First));
+
+        let id = crate::enqueue(&pool, &task).await.unwrap();
+
+        let row = sqlx::query!("SELECT step FROM pg_task WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.step, serde_json::to_string(&task).unwrap());
+    }
+
     #[tokio::test]
     async fn task_macro_forwards_step_and_retry_metadata() {
         let pool = PgPoolOptions::new()

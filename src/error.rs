@@ -33,3 +33,20 @@ pub type StepError = Box<dyn StdError + 'static + Send + Sync>;
 
 /// Result returning from task steps
 pub type StepResult<T> = StdResult<NextStep<T>, StepError>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn error_display_messages_are_stable() {
+        assert_eq!(
+            Error::Db(sqlx::Error::PoolTimedOut, "fetch task".into()).to_string(),
+            "db error: fetch task",
+        );
+        assert_eq!(
+            Error::ListenerReceive(sqlx::Error::PoolClosed).to_string(),
+            "listener can't receive table change notifications",
+        );
+    }
+}

@@ -176,6 +176,23 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn zero_delay_schedules_tasks_immediately(pool: PgPool) {
+        let task = ScheduledTask { value: 12 };
+        let started_at = Utc::now();
+
+        let id = crate::delay(&pool, &task, Duration::ZERO).await.unwrap();
+
+        let finished_at = Utc::now();
+        let row = fetch_task_row(&pool, id).await;
+        assert_eq!(row.step, serde_json::to_string(&task).unwrap());
+        assert_timestamp_between(
+            row.wakeup_at,
+            started_at,
+            finished_at + ChronoDuration::seconds(1),
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn enqueue_schedules_tasks_immediately(pool: PgPool) {
         let task = ScheduledTask { value: 9 };
         let started_at = Utc::now();
@@ -190,6 +207,43 @@ mod tests {
             started_at,
             finished_at + ChronoDuration::seconds(1),
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn schedule_accepts_transaction_executors(pool: PgPool) {
+        let task = ScheduledTask { value: 10 };
+        let at = Utc::now() + ChronoDuration::seconds(5);
+        let mut tx = pool.begin().await.unwrap();
+
+        let id = crate::schedule(&mut *tx, &task, at).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch_task_row(&pool, id).await;
+        assert_eq!(row.step, serde_json::to_string(&task).unwrap());
+        assert!(
+            (row.wakeup_at - at)
+                .num_microseconds()
+                .is_some_and(|diff| diff.abs() <= 1),
+            "scheduled time {0:?} should match {1:?}",
+            row.wakeup_at,
+            at,
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rolled_back_transactions_discard_scheduled_tasks(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+
+        crate::enqueue(&mut *tx, &ScheduledTask { value: 11 })
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+
+        let row_count = sqlx::query!("SELECT id FROM pg_task")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count.len(), 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

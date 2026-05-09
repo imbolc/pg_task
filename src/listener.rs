@@ -329,6 +329,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn take_error_clears_stored_errors() {
+        let listener = Listener::new();
+        listener.set_error_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
+            "listener failed".into(),
+        )));
+
+        assert!(matches!(
+            listener.take_error(),
+            Some(Error::ListenerReceive(sqlx::Error::Protocol(_)))
+        ));
+        assert!(listener.take_error().is_none());
+    }
+
+    #[tokio::test]
     async fn wait_for_returns_when_a_wakeup_arrives_before_the_timeout() {
         let listener = Listener::new();
         let subscription = listener.subscribe();
@@ -492,6 +506,21 @@ mod tests {
         assert!(second_error.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn shutdown_aborts_the_background_task() {
+        let listener = Listener::new();
+        let task = tokio::spawn(pending::<()>());
+        listener.set_task_for_tests(task.abort_handle());
+
+        listener.shutdown();
+
+        let error = timeout(Duration::from_millis(50), task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_cancelled());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn listen_wakes_subscribers_for_task_inserts(pool: PgPool) {
         let listener = Listener::new();
@@ -508,6 +537,61 @@ mod tests {
         .unwrap();
 
         timeout(Duration::from_secs(1), subscription.wait_forever())
+            .await
+            .unwrap();
+
+        assert!(!listener.time_to_stop_worker());
+        assert!(listener.take_error().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn listen_wakes_subscribers_for_non_stop_notifications(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+
+        let subscription = listener.subscribe();
+        sqlx::query!("NOTIFY pg_task_changed, 'wake'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), subscription.wait_forever())
+            .await
+            .unwrap();
+
+        assert!(!listener.time_to_stop_worker());
+        assert!(listener.take_error().is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn listen_wakes_subscribers_for_task_updates_and_deletes(pool: PgPool) {
+        let listener = Listener::new();
+        listener.listen(pool.clone()).await.unwrap();
+        let id = sqlx::query!(
+            "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2) RETURNING id",
+            "{}",
+            Utc::now(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .id;
+
+        let update_subscription = listener.subscribe();
+        sqlx::query!("UPDATE pg_task SET error = $2 WHERE id = $1", id, "boom",)
+            .execute(&pool)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), update_subscription.wait_forever())
+            .await
+            .unwrap();
+
+        let delete_subscription = listener.subscribe();
+        sqlx::query!("DELETE FROM pg_task WHERE id = $1", id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), delete_subscription.wait_forever())
             .await
             .unwrap();
 

@@ -103,6 +103,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_name_preserves_file_contents_exactly() {
+        let path = temp_path();
+        std::fs::write(&path, "Alice\n").unwrap();
+
+        let next = ReadName {
+            filename: path.display().to_string(),
+        }
+        .step(&lazy_pool())
+        .await
+        .unwrap();
+
+        std::fs::remove_file(path).unwrap();
+
+        match next {
+            NextStep::Now(Greeter::SayHello(SayHello { name })) => {
+                assert_eq!(name, "Alice\n");
+            }
+            _ => panic!("expected the greeting step"),
+        }
+    }
+
+    #[tokio::test]
     async fn read_name_returns_io_errors_for_missing_files() {
         let result = ReadName {
             filename: temp_path().display().to_string(),

@@ -182,6 +182,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proceed_finishes_single_step_counts() {
+        let started_at = Utc::now();
+        let next = Proceed {
+            up_to: 1,
+            started_at,
+            cur: 0,
+        }
+        .step(&lazy_pool())
+        .await
+        .unwrap();
+
+        match next {
+            NextStep::Now(Count::Finish(Finish {
+                up_to,
+                started_at: finished_started_at,
+            })) => {
+                assert_eq!(up_to, 1);
+                assert_eq!(finished_started_at, started_at);
+            }
+            _ => panic!("expected the finish step"),
+        }
+    }
+
+    #[tokio::test]
     async fn finish_completes_the_task() {
         assert!(matches!(
             Finish {

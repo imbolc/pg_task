@@ -471,6 +471,11 @@ mod tests {
         key: u64,
     }
 
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct FailStep {
+        key: u64,
+    }
+
     crate::task!(TestTask {
         Noop,
         Advance,
@@ -478,6 +483,7 @@ mod tests {
         Complete,
         Blocking,
         FailSavingError,
+        FailStep,
     });
 
     #[async_trait::async_trait]
@@ -532,6 +538,18 @@ mod tests {
                 .await
                 .unwrap();
             state.record("save error failed");
+            Err(io::Error::other("step failed").into())
+        }
+
+        fn retry_limit(&self) -> i32 {
+            0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for FailStep {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            step_state(self.key).record("started");
             Err(io::Error::other("step failed").into())
         }
 
@@ -837,7 +855,16 @@ mod tests {
         Worker::<TestTask>::handle_heartbeat_event(HeartbeatEvent::Failed, &mut heartbeat_healthy)
             .unwrap();
         assert!(!heartbeat_healthy);
+        Worker::<TestTask>::handle_heartbeat_event(HeartbeatEvent::Failed, &mut heartbeat_healthy)
+            .unwrap();
+        assert!(!heartbeat_healthy);
 
+        Worker::<TestTask>::handle_heartbeat_event(
+            HeartbeatEvent::Recovered,
+            &mut heartbeat_healthy,
+        )
+        .unwrap();
+        assert!(heartbeat_healthy);
         Worker::<TestTask>::handle_heartbeat_event(
             HeartbeatEvent::Recovered,
             &mut heartbeat_healthy,
@@ -886,6 +913,167 @@ mod tests {
 
         assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
         assert!(abort_running_steps);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_recovery_preserves_retryable_fetch_error_handling() {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        );
+        let (heartbeat_events, mut heartbeat_events_receiver) = mpsc::unbounded_channel();
+        heartbeat_events.send(HeartbeatEvent::Failed).unwrap();
+        heartbeat_events.send(HeartbeatEvent::Recovered).unwrap();
+        let mut heartbeat_healthy = true;
+        let mut abort_running_steps = false;
+
+        worker
+            .handle_recv_task_error_or_heartbeat(
+                Error::Db(sqlx::Error::PoolTimedOut, "fetch".into()),
+                &mut heartbeat_events_receiver,
+                &mut heartbeat_healthy,
+                &mut abort_running_steps,
+            )
+            .await
+            .unwrap();
+
+        assert!(heartbeat_healthy);
+        assert!(!abort_running_steps);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_failure_pauses_after_retryable_fetch_error_handling() {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        );
+        let (heartbeat_events, mut heartbeat_events_receiver) = mpsc::unbounded_channel();
+        heartbeat_events.send(HeartbeatEvent::Failed).unwrap();
+        let mut heartbeat_healthy = true;
+        let mut abort_running_steps = false;
+
+        worker
+            .handle_recv_task_error_or_heartbeat(
+                Error::Db(sqlx::Error::PoolTimedOut, "fetch".into()),
+                &mut heartbeat_events_receiver,
+                &mut heartbeat_healthy,
+                &mut abort_running_steps,
+            )
+            .await
+            .unwrap();
+
+        assert!(!heartbeat_healthy);
+        assert!(!abort_running_steps);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn heartbeat_failures_without_running_steps_do_not_expire(pool: PgPool) {
+        init_tracing();
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN lock_expires_at TO task_lock_expires_at")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let worker = Worker::<TestTask>::new(pool)
+            .with_lease_timeout(Duration::from_millis(80))
+            .with_heartbeat_interval(Duration::from_millis(20));
+        let (events, mut events_receiver) = mpsc::unbounded_channel();
+        let heartbeat = worker.spawn_heartbeat(events, Arc::new(Mutex::new(Vec::new())));
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Failed));
+        assert!(timeout(Duration::from_millis(150), events_receiver.recv())
+            .await
+            .is_err());
+
+        heartbeat.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn heartbeat_reports_recovery_after_renewal_failures_stop(pool: PgPool) {
+        init_tracing();
+        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let held_connection = worker_pool.acquire().await.unwrap();
+        let worker = Worker::<TestTask>::new(worker_pool)
+            .with_lease_timeout(Duration::from_millis(500))
+            .with_heartbeat_interval(Duration::from_millis(20));
+        let (events, mut events_receiver) = mpsc::unbounded_channel();
+        let heartbeat = worker.spawn_heartbeat(events, Arc::new(Mutex::new(Vec::new())));
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Failed));
+
+        drop(held_connection);
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Recovered));
+
+        heartbeat.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn heartbeat_reports_recovery_after_live_leases_are_renewed(pool: PgPool) {
+        init_tracing();
+        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let held_connection = worker_pool.acquire().await.unwrap();
+        let worker = Worker::<TestTask>::new(worker_pool)
+            .with_lease_timeout(Duration::from_millis(500))
+            .with_heartbeat_interval(Duration::from_millis(20));
+        let id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let initial_expires_at = Utc::now() + ChronoDuration::milliseconds(200);
+        sqlx::query!(
+            "
+            UPDATE pg_task
+            SET locked_by = $2,
+                lock_expires_at = $3
+            WHERE id = $1
+            ",
+            id,
+            worker.worker_id,
+            initial_expires_at,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (events, mut events_receiver) = mpsc::unbounded_channel();
+        let heartbeat = worker.spawn_heartbeat(events, Arc::new(Mutex::new(Vec::new())));
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Failed));
+
+        drop(held_connection);
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Recovered));
+
+        let (_locked_by, renewed_expires_at) = fetch_task_lease(&pool, id).await.unwrap();
+        assert!(renewed_expires_at > initial_expires_at);
+
+        heartbeat.abort();
     }
 
     #[tokio::test]
@@ -1085,6 +1273,41 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_skips_invalid_tasks_and_returns_next_ready_task(pool: PgPool) {
+        let invalid_id = insert_raw_task(
+            &pool,
+            "not-json",
+            Utc::now() - ChronoDuration::seconds(2),
+            false,
+            None,
+        )
+        .await;
+        let expected = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::seconds(1),
+            false,
+        )
+        .await;
+        let worker = Worker::<TestTask>::new(pool.clone());
+
+        let (task, step, _lease) = worker.recv_task().await.unwrap().unwrap();
+
+        assert_eq!(task.id, expected);
+        assert!(matches!(step, TestTask::Noop(Noop)));
+        let invalid_row = sqlx::query!(
+            "SELECT locked_by, lock_expires_at, error FROM pg_task WHERE id = $1",
+            invalid_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(invalid_row.locked_by.is_none());
+        assert!(invalid_row.lock_expires_at.is_none());
+        assert!(invalid_row.error.is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn recv_task_rechecks_locked_ready_tasks_without_notifications(pool: PgPool) {
         let id = insert_task_at(
             &pool,
@@ -1143,6 +1366,28 @@ mod tests {
             .unwrap();
         assert_eq!(task.id, id);
         assert!(matches!(step, TestTask::Noop(Noop)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_replaces_expired_lease_with_the_current_worker(pool: PgPool) {
+        let id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            true,
+        )
+        .await;
+        set_task_lease(&pool, id, Utc::now() - ChronoDuration::milliseconds(1)).await;
+        let worker = Worker::<TestTask>::new(pool.clone());
+        let worker_id = worker.worker_id;
+
+        let (task, step, _lease) = worker.recv_task().await.unwrap().unwrap();
+
+        assert_eq!(task.id, id);
+        assert!(matches!(step, TestTask::Noop(Noop)));
+        let (locked_by, lock_expires_at) = fetch_task_lease(&pool, id).await.unwrap();
+        assert_eq!(locked_by, worker_id);
+        assert!(lock_expires_at > Utc::now());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1310,6 +1555,68 @@ mod tests {
             .unwrap();
 
         assert!(state.state().events().is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_listener_errors_while_fetching_is_paused(pool: PgPool) {
+        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker = Arc::new(
+            Worker::<TestTask>::new(worker_pool)
+                .with_concurrency(nonzero(1))
+                .with_lease_timeout(Duration::from_millis(200))
+                .with_heartbeat_interval(Duration::from_millis(50)),
+        );
+        let run = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.run().await }
+        });
+
+        sleep(Duration::from_millis(1250)).await;
+        worker
+            .listener
+            .set_error_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
+                "listener failed".into(),
+            )));
+
+        let err = timeout(Duration::from_secs(3), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ListenerReceive(sqlx::Error::Protocol(_))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_keeps_waiting_after_retryable_errors_while_fetching_is_paused(pool: PgPool) {
+        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker = Arc::new(
+            Worker::<TestTask>::new(worker_pool)
+                .with_concurrency(nonzero(1))
+                .with_lease_timeout(Duration::from_millis(200))
+                .with_heartbeat_interval(Duration::from_millis(50)),
+        );
+        let run = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.run().await }
+        });
+
+        sleep(Duration::from_millis(1250)).await;
+        worker
+            .listener
+            .set_error_for_tests(Error::Db(sqlx::Error::PoolTimedOut, "fetch task".into()));
+        sleep(Duration::from_millis(1300)).await;
+        assert!(!run.is_finished());
+
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(3), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1590,6 +1897,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_stops_when_stop_notification_arrives_while_idle(pool: PgPool) {
+        let worker = spawn_worker(pool.clone());
+
+        sleep(Duration::from_millis(100)).await;
+        stop_worker(&pool).await;
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_wakes_up_for_tasks_inserted_while_idle(pool: PgPool) {
         let state = StepStateGuard::new();
         let worker = spawn_worker(pool.clone());
@@ -1807,6 +2129,33 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_step_errors_from_spawned_tasks(pool: PgPool) {
+        let state = StepStateGuard::new();
+        sqlx::query!("ALTER TABLE pg_task ADD CONSTRAINT reject_errors CHECK (error IS NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_task(
+            &pool,
+            &TestTask::FailStep(FailStep { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker(pool);
+
+        state.state().wait_for_events(1).await;
+        let err = timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(state.state().events(), vec!["started"]);
+        assert!(matches!(err, Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_processes_multiple_blocking_steps_up_to_the_concurrency_limit(pool: PgPool) {
         let first = StepStateGuard::new();
         let second = StepStateGuard::new();
@@ -1833,6 +2182,66 @@ mod tests {
 
         first.state().release();
         second.state().release();
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.state().events(), vec!["started", "completed"]);
+        assert_eq!(second.state().events(), vec!["started", "completed"]);
+        assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_respects_the_configured_concurrency_limit(pool: PgPool) {
+        let first = StepStateGuard::new();
+        let second = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: first.key() }),
+            false,
+        )
+        .await;
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: second.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker_with_concurrency(pool.clone(), 1);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let started_count = usize::from(!first.state().events().is_empty())
+                    + usize::from(!second.state().events().is_empty());
+                if started_count == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sleep(Duration::from_millis(100)).await;
+        let first_started = !first.state().events().is_empty();
+        let second_started = !second.state().events().is_empty();
+        assert_ne!(first_started, second_started);
+
+        if first_started {
+            first.state().release();
+            second.state().wait_for_events(1).await;
+            stop_worker(&pool).await;
+            second.state().release();
+        } else {
+            second.state().release();
+            first.state().wait_for_events(1).await;
+            stop_worker(&pool).await;
+            first.state().release();
+        }
 
         timeout(Duration::from_secs(1), worker)
             .await

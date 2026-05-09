@@ -167,6 +167,18 @@ mod tests {
     }
 
     #[test]
+    fn documented_database_connection_error_codes_are_retryable() {
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "08007", "57P01", "57P02",
+        ] {
+            assert!(
+                is_retryable_database_error(Some(code), false),
+                "{code} should be retryable",
+            );
+        }
+    }
+
+    #[test]
     fn protocol_violation_is_not_retryable() {
         assert!(!is_retryable_database_error(Some("08P01"), false));
     }
@@ -183,6 +195,13 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn wait_for_reconnection_returns_when_the_database_is_available(pool: PgPool) {
+        wait_for_reconnection(&pool, Duration::from_millis(10))
+            .await
+            .unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]
