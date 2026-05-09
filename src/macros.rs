@@ -64,7 +64,14 @@ mod tests {
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     pub(super) struct Second;
 
-    crate::task!(MacroTask { First, Second });
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Third;
+
+    crate::task!(MacroTask {
+        First,
+        Second,
+        Third
+    });
     crate::scheduler!(MacroScheduler { MacroTask });
 
     #[async_trait::async_trait]
@@ -81,6 +88,13 @@ mod tests {
     impl crate::Step<MacroTask> for Second {
         async fn step(self, _db: &PgPool) -> crate::StepResult<MacroTask> {
             crate::NextStep::none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Step<MacroTask> for Third {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<MacroTask> {
+            crate::NextStep::now(Second)
         }
     }
 
@@ -130,6 +144,20 @@ mod tests {
                 .await
                 .unwrap(),
             crate::NextStep::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_macro_forwards_immediate_steps() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(matches!(
+            crate::Step::<MacroTask>::step(MacroTask::Third(Third), &pool)
+                .await
+                .unwrap(),
+            crate::NextStep::Now(MacroTask::Second(Second))
         ));
     }
 }

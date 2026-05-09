@@ -1038,6 +1038,53 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_stops_while_waiting_for_work(pool: PgPool) {
+        let worker = Arc::new(Worker::<TestTask>::new(pool));
+        let recv = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.recv_task().await }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!recv.is_finished());
+        worker.listener.stop_worker_for_tests();
+
+        let received = timeout(Duration::from_secs(1), recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(received.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn recv_task_returns_listener_errors_while_waiting_for_work(pool: PgPool) {
+        let worker = Arc::new(Worker::<TestTask>::new(pool));
+        let recv = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.recv_task().await }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!recv.is_finished());
+        worker
+            .listener
+            .set_error_and_notify_for_tests(Error::ListenerReceive(sqlx::Error::Protocol(
+                "listener failed".into(),
+            )));
+
+        let err = timeout(Duration::from_secs(1), recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ListenerReceive(sqlx::Error::Protocol(_))
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn recv_task_rechecks_locked_ready_tasks_without_notifications(pool: PgPool) {
         let id = insert_task_at(
             &pool,

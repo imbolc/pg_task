@@ -1096,6 +1096,70 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_available_at_returns_lease_expiry_for_ready_leased_tasks(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            true,
+            None,
+        )
+        .await;
+        set_task_lease(
+            &pool,
+            expected,
+            other_worker_id(),
+            now + ChronoDuration::seconds(5),
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let wakeup_at = Task::fetch_next_available_at(&mut tx)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch_task_row(&pool, expected).await.unwrap();
+        assert_eq!(wakeup_at, row.lock_expires_at.unwrap());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_available_at_keeps_future_leased_tasks_delayed_until_wakeup(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(5),
+            0,
+            true,
+            None,
+        )
+        .await;
+        set_task_lease(
+            &pool,
+            expected,
+            other_worker_id(),
+            now + ChronoDuration::seconds(1),
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let wakeup_at = Task::fetch_next_available_at(&mut tx)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch_task_row(&pool, expected).await.unwrap();
+        assert_eq!(wakeup_at, row.wakeup_at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_step_completes_tasks(pool: PgPool) {
         init_tracing();
         let (task, step, lease) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
@@ -1199,6 +1263,31 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_does_not_save_next_step_after_losing_the_lease(pool: PgPool) {
+        init_tracing();
+        let (task, step, lease) =
+            claim_task(&pool, TestTask::AdvanceNow(AdvanceNow { value: 41 }), 2).await;
+        set_task_lease(
+            &pool,
+            task.id,
+            other_worker_id(),
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .await;
+
+        task.run_step(&pool, step, lease).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(
+            row.step,
+            serialized_step(&TestTask::AdvanceNow(AdvanceNow { value: 41 })),
+        );
+        assert_eq!(row.tried, 2);
+        assert_eq!(row.locked_by, Some(other_worker_id()));
+        assert!(row.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_step_returns_db_errors_when_saving_next_step_fails(pool: PgPool) {
         let step = TestTask::AdvanceNow(AdvanceNow { value: 41 });
         let id = insert_task(&pool, &step, 2, false).await;
@@ -1235,6 +1324,27 @@ mod tests {
             started_at + retry_delay,
             finished_at + retry_delay + ChronoDuration::seconds(1),
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_does_not_schedule_retries_after_losing_the_lease(pool: PgPool) {
+        init_tracing();
+        let (task, step, lease) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
+        set_task_lease(
+            &pool,
+            task.id,
+            other_worker_id(),
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .await;
+
+        task.run_step(&pool, step, lease).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
+        assert_eq!(row.tried, 1);
+        assert_eq!(row.locked_by, Some(other_worker_id()));
+        assert!(row.error.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1280,6 +1390,29 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_does_not_save_terminal_errors_after_losing_the_lease(pool: PgPool) {
+        init_tracing();
+        let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
+        let (task, step, lease) =
+            claim_task(&pool, TestTask::RetryFail(RetryFail), retry_limit).await;
+        set_task_lease(
+            &pool,
+            task.id,
+            other_worker_id(),
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .await;
+
+        task.run_step(&pool, step, lease).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
+        assert_eq!(row.tried, retry_limit);
+        assert_eq!(row.locked_by, Some(other_worker_id()));
+        assert!(row.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn run_step_returns_db_errors_when_saving_terminal_errors_fails(pool: PgPool) {
         let step = TestTask::RetryFail(RetryFail);
         let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
@@ -1310,5 +1443,28 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("can't serialize test step")));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_does_not_save_next_step_serialization_errors_after_losing_the_lease(
+        pool: PgPool,
+    ) {
+        init_tracing();
+        let (task, step, lease) = claim_task(&pool, TestTask::BrokenNext(BrokenNext), 0).await;
+        set_task_lease(
+            &pool,
+            task.id,
+            other_worker_id(),
+            Utc::now() + ChronoDuration::seconds(60),
+        )
+        .await;
+
+        task.run_step(&pool, step, lease).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::BrokenNext(BrokenNext)),);
+        assert_eq!(row.tried, 0);
+        assert_eq!(row.locked_by, Some(other_worker_id()));
+        assert!(row.error.is_none());
     }
 }

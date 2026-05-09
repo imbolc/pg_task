@@ -345,6 +345,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_returns_when_the_timeout_expires_without_a_wakeup() {
+        let listener = Listener::new();
+
+        timeout(
+            Duration::from_millis(100),
+            listener.subscribe().wait_for(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        assert!(!listener.time_to_stop_worker());
+        assert!(listener.take_error().is_none());
+    }
+
+    #[tokio::test]
     async fn pool_timeouts_do_not_become_terminal_listener_errors() {
         init_tracing();
         let error_slot = Mutex::new(None);
