@@ -1277,6 +1277,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_run_keeps_heartbeat_alive_while_waiting_for_inflight_steps() {
+        init_tracing();
+        let worker = Arc::new(
+            Worker::<TestTask>::new(
+                PgPoolOptions::new()
+                    .connect_lazy("postgres:///pg_task")
+                    .unwrap(),
+            )
+            .with_concurrency(nonzero(1)),
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let heartbeat = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let finish = tokio::spawn({
+            let worker = worker.clone();
+            let semaphore = semaphore.clone();
+            let heartbeat_abort = heartbeat.abort_handle();
+            async move {
+                worker
+                    .finish_run(
+                        Ok(()),
+                        semaphore,
+                        heartbeat_abort,
+                        Arc::new(Mutex::new(Vec::new())),
+                        false,
+                    )
+                    .await
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!finish.is_finished());
+        assert!(!heartbeat.is_finished());
+
+        drop(permit);
+
+        timeout(Duration::from_secs(1), finish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(heartbeat.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn finish_run_aborts_inflight_steps_when_lease_renewal_expires() {
         init_tracing();
         let worker = Worker::<TestTask>::new(
