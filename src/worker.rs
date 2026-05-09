@@ -1277,6 +1277,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_run_aborts_inflight_steps_when_lease_renewal_expires() {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        )
+        .with_concurrency(nonzero(1));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let running_step = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+
+        let err = timeout(
+            Duration::from_secs(1),
+            worker.finish_run(
+                Err(Error::Db(sqlx::Error::PoolTimedOut, "test".into())),
+                semaphore,
+                idle_heartbeat(),
+                running_steps,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
+        assert!(running_step.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn wait_for_steps_to_finish_rechecks_when_the_inflight_task_count_changes() {
         init_tracing();
         let worker = Arc::new(
