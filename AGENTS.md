@@ -44,6 +44,8 @@ cargo shear
 
 #### Coding style
 
+- Always use compile-time checked sqlx macros, e.g. `query!` over `query`
+
 ##### Deriving macros from external crates
 
 - Use fully qualified paths, e.g. `serde::Derialize`

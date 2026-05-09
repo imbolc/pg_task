@@ -103,10 +103,36 @@ pub(crate) use db_error;
 #[cfg(test)]
 mod tests {
     use super::{
-        is_connection_error, is_pool_timeout, is_retryable_database_error, wait_for_reconnection,
+        chrono_duration_to_std, is_connection_error, is_pool_timeout, is_retryable_database_error,
+        ordinal, std_duration_to_chrono, wait_for_reconnection,
     };
-    use sqlx::PgPool;
+    use chrono::Duration as ChronoDuration;
+    use sqlx::{postgres::PgPoolOptions, PgPool};
     use std::{io, time::Duration};
+
+    #[test]
+    fn chrono_duration_to_std_uses_the_absolute_value() {
+        let duration = ChronoDuration::seconds(-1) - ChronoDuration::milliseconds(250);
+
+        assert_eq!(
+            chrono_duration_to_std(duration),
+            Duration::from_millis(1250)
+        );
+    }
+
+    #[test]
+    fn std_duration_to_chrono_saturates_on_overflow() {
+        assert_eq!(std_duration_to_chrono(Duration::MAX), ChronoDuration::MAX);
+    }
+
+    #[test]
+    fn ordinal_handles_teens_and_negative_numbers() {
+        assert_eq!(ordinal(1), "1st");
+        assert_eq!(ordinal(2), "2nd");
+        assert_eq!(ordinal(12), "12th");
+        assert_eq!(ordinal(23), "23rd");
+        assert_eq!(ordinal(-4), "-4th");
+    }
 
     #[test]
     fn transport_connection_errors_are_retryable() {
@@ -147,7 +173,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn wait_for_reconnection_returns_permanent_errors(pool: PgPool) {
-        sqlx::query("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
             .execute(&pool)
             .await
             .unwrap();
@@ -157,5 +183,33 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn wait_for_reconnection_retries_pool_timeouts_until_the_database_is_available(
+        pool: PgPool,
+    ) {
+        let db_name: String = sqlx::query_scalar!(r#"SELECT current_database() AS "db_name!""#)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let retry_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(20))
+            .connect(&format!("postgres:///{db_name}"))
+            .await
+            .unwrap();
+        let held_connection = retry_pool.acquire().await.unwrap();
+        let wait_pool = retry_pool.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_reconnection(&wait_pool, Duration::from_millis(10)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+
+        drop(held_connection);
+
+        waiter.await.unwrap().unwrap();
     }
 }

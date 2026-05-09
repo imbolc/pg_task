@@ -17,13 +17,12 @@ pub struct Task {
     pub id: Uuid,
     step: String,
     tried: i32,
-    pub wakeup_at: DateTime<Utc>,
 }
 
 impl Task {
-    /// Returns a delay before running the task
-    pub fn wait_before_running(&self) -> Option<Duration> {
-        let delay = self.wakeup_at - Utc::now();
+    /// Returns a delay before a task should run at the given time.
+    pub fn delay_until(wakeup_at: DateTime<Utc>) -> Option<Duration> {
+        let delay = wakeup_at - Utc::now();
         if delay <= chrono::Duration::zero() {
             None
         } else {
@@ -31,23 +30,41 @@ impl Task {
         }
     }
 
-    /// Fetches the closest task to run
-    pub async fn fetch_closest(con: &mut PgConnection) -> Result<Option<Self>> {
-        trace!("Fetching the closest task to run");
+    /// Fetches the closest ready unlocked task to run.
+    pub async fn fetch_ready(con: &mut PgConnection) -> Result<Option<Self>> {
+        trace!("Fetching the closest ready task to run");
         sqlx::query_as!(
             Task,
             r#"
             SELECT
                 id,
                 step,
-                tried,
-                wakeup_at
+                tried
+            FROM pg_task
+            WHERE is_running = false
+              AND error IS NULL
+              AND wakeup_at <= now()
+            ORDER BY wakeup_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_optional(con)
+        .await
+        .map_err(db_error!())
+    }
+
+    /// Fetches the closest scheduled task time.
+    pub async fn fetch_next_wakeup_at(con: &mut PgConnection) -> Result<Option<DateTime<Utc>>> {
+        trace!("Fetching the closest scheduled task time");
+        sqlx::query_scalar!(
+            r#"
+            SELECT wakeup_at
             FROM pg_task
             WHERE is_running = false
               AND error IS NULL
             ORDER BY wakeup_at
             LIMIT 1
-            FOR UPDATE
             "#,
         )
         .fetch_optional(con)
@@ -246,19 +263,253 @@ impl Task {
 mod tests {
     use super::Task;
     use crate::{NextStep, Step};
-    use chrono::Utc;
-    use sqlx::PgPool;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use sqlx::{types::Uuid, PgPool};
+    use std::{io, time::Duration};
+
+    fn init_tracing() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .without_time()
+                .try_init();
+        });
+    }
 
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
-    pub(super) struct ValidStep;
+    pub(super) struct Valid;
 
-    crate::task!(TestTask { ValidStep });
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct AdvanceNow {
+        value: i32,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct AdvanceLater {
+        value: i32,
+        delay_ms: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Followup {
+        value: i32,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct RetryFail;
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct BrokenNext;
+
+    #[derive(Debug)]
+    pub(super) struct Unserializable;
+
+    crate::task!(TestTask {
+        Valid,
+        AdvanceNow,
+        AdvanceLater,
+        Followup,
+        RetryFail,
+        BrokenNext,
+        Unserializable,
+    });
 
     #[async_trait::async_trait]
-    impl Step<TestTask> for ValidStep {
+    impl Step<TestTask> for Valid {
         async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
             Ok(NextStep::None)
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for AdvanceNow {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            NextStep::now(Followup {
+                value: self.value + 1,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for AdvanceLater {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            NextStep::delay(
+                Followup {
+                    value: self.value + 1,
+                },
+                Duration::from_millis(self.delay_ms),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Followup {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            NextStep::none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for RetryFail {
+        const RETRY_LIMIT: i32 = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            Err(io::Error::other("retryable failure").into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for BrokenNext {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            NextStep::now(Unserializable)
+        }
+    }
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("can't serialize test step"))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Unserializable {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            <() as serde::Deserialize>::deserialize(deserializer)?;
+            Ok(Self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Step<TestTask> for Unserializable {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<TestTask> {
+            unreachable!("the test never executes the unserializable step")
+        }
+    }
+
+    #[derive(Debug)]
+    struct TaskRow {
+        step: String,
+        wakeup_at: DateTime<Utc>,
+        tried: i32,
+        is_running: bool,
+        error: Option<String>,
+    }
+
+    fn serialized_step(step: &TestTask) -> String {
+        serde_json::to_string(step).unwrap()
+    }
+
+    fn task_with_step(id: Uuid, step: &TestTask, tried: i32) -> Task {
+        Task {
+            id,
+            step: serialized_step(step),
+            tried,
+        }
+    }
+
+    fn raw_task(id: Uuid, step: &str, tried: i32) -> Task {
+        Task {
+            id,
+            step: step.into(),
+            tried,
+        }
+    }
+
+    fn assert_database_error(err: crate::Error) {
+        assert!(matches!(err, crate::Error::Db(sqlx::Error::Database(_), _)));
+    }
+
+    async fn insert_task_row(
+        pool: &PgPool,
+        step: &str,
+        wakeup_at: DateTime<Utc>,
+        tried: i32,
+        is_running: bool,
+        error: Option<&str>,
+    ) -> Uuid {
+        sqlx::query!(
+            "
+            INSERT INTO pg_task (step, wakeup_at, tried, is_running, error)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            ",
+            step,
+            wakeup_at,
+            tried,
+            is_running,
+            error,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn insert_task(pool: &PgPool, step: &TestTask, tried: i32, is_running: bool) -> Uuid {
+        let step = serialized_step(step);
+        insert_task_row(
+            pool,
+            &step,
+            Utc::now() - ChronoDuration::milliseconds(1),
+            tried,
+            is_running,
+            None,
+        )
+        .await
+    }
+
+    async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask) {
+        let id = insert_task(pool, &step, tried, false).await;
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
+        assert_eq!(task.id, id);
+        let claimed = task.claim::<TestTask>(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+        (task, claimed)
+    }
+
+    async fn fetch_task_row(pool: &PgPool, id: Uuid) -> Option<TaskRow> {
+        sqlx::query!(
+            "
+            SELECT step, wakeup_at, tried, is_running, error
+            FROM pg_task
+            WHERE id = $1
+            ",
+            id,
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .map(|row| TaskRow {
+            step: row.step,
+            wakeup_at: row.wakeup_at,
+            tried: row.tried,
+            is_running: row.is_running,
+            error: row.error,
+        })
+    }
+
+    fn assert_timestamp_between(
+        actual: DateTime<Utc>,
+        earliest: DateTime<Utc>,
+        latest: DateTime<Utc>,
+    ) {
+        assert!(
+            actual >= earliest,
+            "timestamp {actual:?} should be after {earliest:?}",
+        );
+        assert!(
+            actual <= latest,
+            "timestamp {actual:?} should be before {latest:?}",
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -273,7 +524,7 @@ mod tests {
         .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let task = Task::fetch_closest(&mut tx).await.unwrap().unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
 
         assert!(task.claim::<TestTask>(&mut tx).await.unwrap().is_none());
 
@@ -287,5 +538,391 @@ mod tests {
         assert_eq!(row.tried, 0);
         assert!(!row.is_running);
         assert!(row.error.is_some());
+    }
+
+    #[test]
+    fn unserializable_deserializes_from_unit() {
+        serde_json::from_str::<Unserializable>("null").unwrap();
+    }
+
+    #[tokio::test]
+    async fn followup_step_returns_none() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(matches!(
+            crate::Step::<TestTask>::step(TestTask::Followup(Followup { value: 7 }), &pool)
+                .await
+                .unwrap(),
+            NextStep::None
+        ));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "the test never executes the unserializable step")]
+    async fn unserializable_step_panics_if_executed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        let _ =
+            crate::Step::<TestTask>::step(TestTask::Unserializable(Unserializable), &pool).await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_ready_returns_db_errors_for_query_failures(pool: PgPool) {
+        insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = Task::fetch_ready(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn mark_running_returns_db_errors_for_update_failures(pool: PgPool) {
+        let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
+        let task = task_with_step(id, &TestTask::Valid(Valid), 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN is_running TO running_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = task.mark_running(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_returns_db_errors_when_saving_deserialization_failures_fails(pool: PgPool) {
+        let id = insert_task_row(&pool, "not-json", Utc::now(), 0, false, None).await;
+        let task = raw_task(id, "not-json", 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN error TO task_error")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let err = task.claim::<TestTask>(&mut tx).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_marks_valid_steps_running(pool: PgPool) {
+        let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
+        let claimed = task.claim::<TestTask>(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert!(matches!(claimed, Some(TestTask::Valid(Valid))));
+
+        let row = fetch_task_row(&pool, id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::Valid(Valid)));
+        assert_eq!(row.tried, 0);
+        assert!(row.is_running);
+        assert!(row.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_ready_ignores_running_errored_and_future_tasks_and_picks_the_earliest_ready_one(
+        pool: PgPool,
+    ) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(3),
+            0,
+            true,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(2),
+            0,
+            false,
+            Some("boom"),
+        )
+        .await;
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(task.id, expected);
+        assert_eq!(task.step, valid);
+        assert_eq!(task.tried, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fetch_next_wakeup_at_returns_the_earliest_visible_eligible_task(pool: PgPool) {
+        let now = Utc::now();
+        let valid = serialized_step(&TestTask::Valid(Valid));
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(3),
+            0,
+            true,
+            None,
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now - ChronoDuration::seconds(2),
+            0,
+            false,
+            Some("boom"),
+        )
+        .await;
+        insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(2),
+            0,
+            false,
+            None,
+        )
+        .await;
+        let expected = insert_task_row(
+            &pool,
+            &valid,
+            now + ChronoDuration::seconds(1),
+            0,
+            false,
+            None,
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let wakeup_at = Task::fetch_next_wakeup_at(&mut tx).await.unwrap().unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch_task_row(&pool, expected).await.unwrap();
+        assert_eq!(wakeup_at, row.wakeup_at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_completes_tasks(pool: PgPool) {
+        init_tracing();
+        let (task, step) = claim_task(&pool, TestTask::Valid(Valid), 0).await;
+
+        task.run_step(&pool, step).await.unwrap();
+
+        assert!(fetch_task_row(&pool, task.id).await.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_completing_tasks_fails(pool: PgPool) {
+        let step = TestTask::Valid(Valid);
+        let id = insert_task(&pool, &step, 0, false).await;
+        let task = task_with_step(id, &step, 0);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_saves_immediate_next_step_and_resets_retries(pool: PgPool) {
+        let (task, step) =
+            claim_task(&pool, TestTask::AdvanceNow(AdvanceNow { value: 41 }), 2).await;
+        let started_at = Utc::now();
+
+        task.run_step(&pool, step).await.unwrap();
+
+        let finished_at = Utc::now();
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(
+            row.step,
+            serialized_step(&TestTask::Followup(Followup { value: 42 })),
+        );
+        assert_eq!(row.tried, 0);
+        assert!(!row.is_running);
+        assert!(row.error.is_none());
+        assert_timestamp_between(
+            row.wakeup_at,
+            started_at,
+            finished_at + ChronoDuration::seconds(1),
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_saves_delayed_next_step_and_resets_retries(pool: PgPool) {
+        let delay = Duration::from_millis(250);
+        let (task, step) = claim_task(
+            &pool,
+            TestTask::AdvanceLater(AdvanceLater {
+                value: 9,
+                delay_ms: delay.as_millis() as u64,
+            }),
+            3,
+        )
+        .await;
+        let started_at = Utc::now();
+
+        task.run_step(&pool, step).await.unwrap();
+
+        let finished_at = Utc::now();
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        let delay = ChronoDuration::from_std(delay).unwrap();
+        assert_eq!(
+            row.step,
+            serialized_step(&TestTask::Followup(Followup { value: 10 })),
+        );
+        assert_eq!(row.tried, 0);
+        assert!(!row.is_running);
+        assert!(row.error.is_none());
+        assert_timestamp_between(
+            row.wakeup_at,
+            started_at + delay,
+            finished_at + delay + ChronoDuration::seconds(1),
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_saving_next_step_fails(pool: PgPool) {
+        let step = TestTask::AdvanceNow(AdvanceNow { value: 41 });
+        let id = insert_task(&pool, &step, 2, false).await;
+        let task = task_with_step(id, &step, 2);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN step TO task_step")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_schedules_retries_before_the_retry_limit(pool: PgPool) {
+        init_tracing();
+        let retry_delay = <RetryFail as Step<TestTask>>::RETRY_DELAY;
+        let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), 1).await;
+        let started_at = Utc::now();
+
+        task.run_step(&pool, step).await.unwrap();
+
+        let finished_at = Utc::now();
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        let retry_delay = ChronoDuration::from_std(retry_delay).unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
+        assert_eq!(row.tried, 2);
+        assert!(!row.is_running);
+        assert!(row.error.is_none());
+        assert_timestamp_between(
+            row.wakeup_at,
+            started_at + retry_delay,
+            finished_at + retry_delay + ChronoDuration::seconds(1),
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_retrying_fails(pool: PgPool) {
+        let step = TestTask::RetryFail(RetryFail);
+        let id = insert_task(&pool, &step, 1, false).await;
+        let task = task_with_step(id, &step, 1);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN wakeup_at TO scheduled_at")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_saves_terminal_errors_after_retry_limit(pool: PgPool) {
+        init_tracing();
+        let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
+        let (task, step) = claim_task(&pool, TestTask::RetryFail(RetryFail), retry_limit).await;
+        let started_at = Utc::now();
+
+        task.run_step(&pool, step).await.unwrap();
+
+        let finished_at = Utc::now();
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::RetryFail(RetryFail)));
+        assert_eq!(row.tried, retry_limit + 1);
+        assert!(!row.is_running);
+        assert!(row
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retryable failure")));
+        assert_timestamp_between(
+            row.wakeup_at,
+            started_at,
+            finished_at + ChronoDuration::seconds(1),
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_returns_db_errors_when_saving_terminal_errors_fails(pool: PgPool) {
+        let step = TestTask::RetryFail(RetryFail);
+        let retry_limit = <RetryFail as Step<TestTask>>::RETRY_LIMIT;
+        let id = insert_task(&pool, &step, retry_limit, false).await;
+        let task = task_with_step(id, &step, retry_limit);
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN error TO task_error")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = task.run_step(&pool, step).await.unwrap_err();
+
+        assert_database_error(err);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_step_saves_next_step_serialization_failures_as_errors(pool: PgPool) {
+        let (task, step) = claim_task(&pool, TestTask::BrokenNext(BrokenNext), 0).await;
+
+        task.run_step(&pool, step).await.unwrap();
+
+        let row = fetch_task_row(&pool, task.id).await.unwrap();
+        assert_eq!(row.step, serialized_step(&TestTask::BrokenNext(BrokenNext)),);
+        assert_eq!(row.tried, 1);
+        assert!(!row.is_running);
+        assert!(row
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("can't serialize test step")));
     }
 }
