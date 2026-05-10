@@ -33,6 +33,11 @@ struct RunEvents {
     step_errors: mpsc::UnboundedReceiver<Error>,
 }
 
+enum TaskAvailability {
+    Ready,
+    Stopped,
+}
+
 /// A worker for processing tasks
 pub struct Worker<T> {
     db: PgPool,
@@ -100,7 +105,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         let mut reserved_permit = None;
 
         let result = loop {
-            let received = tokio::select! {
+            let availability = tokio::select! {
                 biased;
 
                 Some(error) = step_errors.recv() => {
@@ -143,25 +148,43 @@ impl<S: Step<S> + 'static> Worker<S> {
                     reserved_permit = Some(permit.map_err(Error::UnreachableWorkerSemaphoreClosed)?);
                     continue;
                 }
-                received = self.recv_task(lease), if heartbeat_healthy && reserved_permit.is_some() => received,
+                availability = self.wait_for_available_task(), if heartbeat_healthy && reserved_permit.is_some() => availability,
             };
-            match received {
-                Ok(Some((task, step, lease))) => {
-                    let permit = reserved_permit
-                        .take()
-                        .expect("task fetching requires a reserved semaphore permit");
-                    let db = self.db.clone();
-                    let step_error_sender = step_error_sender.clone();
-                    let step = tokio::spawn(async move {
-                        if let Err(e) = task.run_step(&db, step, lease).await {
-                            error!("[{}] {}", task.id, source_chain::to_string(&e));
-                            let _ = step_error_sender.send(e);
-                        };
-                        drop(permit);
-                    });
-                    Self::track_running_step(&running_steps, step.abort_handle());
-                }
-                Ok(None) => {
+            match availability {
+                Ok(TaskAvailability::Ready) => match self.claim_available_task(lease).await {
+                    Ok(Some((task, step, lease))) => {
+                        let permit = reserved_permit
+                            .take()
+                            .expect("task claiming requires a reserved semaphore permit");
+                        let db = self.db.clone();
+                        let step_error_sender = step_error_sender.clone();
+                        let step = tokio::spawn(async move {
+                            if let Err(e) = task.run_step(&db, step, lease).await {
+                                error!("[{}] {}", task.id, source_chain::to_string(&e));
+                                let _ = step_error_sender.send(e);
+                            };
+                            drop(permit);
+                        });
+                        Self::track_running_step(&running_steps, step.abort_handle());
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        drop(reserved_permit.take());
+                        if let Err(error) = self
+                            .handle_recv_task_error_or_heartbeat(
+                                e,
+                                &mut heartbeat_events,
+                                &mut heartbeat_healthy,
+                                &mut abort_running_steps,
+                            )
+                            .await
+                        {
+                            drop(reserved_permit.take());
+                            break Err(error);
+                        }
+                    }
+                },
+                Ok(TaskAvailability::Stopped) => {
                     drop(reserved_permit.take());
                     break Ok(());
                 }
@@ -203,14 +226,12 @@ impl<S: Step<S> + 'static> Worker<S> {
         );
     }
 
-    /// Waits until the next task is ready, marks it running and returns it.
-    /// Returns `None` if the worker is stopped
-    async fn recv_task(&self, lease: TaskLease) -> Result<Option<(Task, S, TaskLease)>> {
-        trace!("Receiving the next task");
-
+    /// Waits until a task may be claimed without mutating task leases.
+    async fn wait_for_available_task(&self) -> Result<TaskAvailability> {
+        trace!("Waiting for an available task");
         loop {
             if self.listener.time_to_stop_worker() {
-                return Ok(None);
+                return Ok(TaskAvailability::Stopped);
             }
 
             if let Some(error) = self.listener.take_error() {
@@ -220,26 +241,56 @@ impl<S: Step<S> + 'static> Worker<S> {
             let table_changes = self.listener.subscribe();
             let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
-            let Some(task) = Task::fetch_ready(&mut tx).await? else {
-                let next_available_at = Task::fetch_next_available_at(&mut tx).await?;
-                tx.commit().await.map_err(db_error!("no ready tasks"))?;
+            if Task::fetch_ready(&mut tx).await?.is_some() {
+                tx.commit().await.map_err(db_error!("ready task check"))?;
+                return Ok(TaskAvailability::Ready);
+            }
 
-                if let Some(available_at) = next_available_at {
-                    let delay =
-                        Task::delay_until(available_at).unwrap_or(LOCKED_TASK_RECHECK_DELAY);
-                    table_changes.wait_for(delay).await;
-                } else {
-                    table_changes.wait_forever().await;
-                }
-                continue;
-            };
+            let next_available_at = Task::fetch_next_available_at(&mut tx).await?;
+            tx.commit().await.map_err(db_error!("no ready tasks"))?;
 
-            let Some(step) = task.claim(&mut tx, lease).await? else {
-                tx.commit().await.map_err(db_error!("save error"))?;
-                continue;
-            };
-            tx.commit().await.map_err(db_error!("mark running"))?;
-            return Ok(Some((task, step, lease)));
+            if let Some(available_at) = next_available_at {
+                let delay = Task::delay_until(available_at).unwrap_or(LOCKED_TASK_RECHECK_DELAY);
+                table_changes.wait_for(delay).await;
+            } else {
+                table_changes.wait_forever().await;
+            }
+        }
+    }
+
+    /// Claims a currently available task and marks it running.
+    async fn claim_available_task(&self, lease: TaskLease) -> Result<Option<(Task, S, TaskLease)>> {
+        trace!("Claiming an available task");
+        let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
+
+        let Some(task) = Task::fetch_ready(&mut tx).await? else {
+            tx.commit().await.map_err(db_error!("no ready tasks"))?;
+            return Ok(None);
+        };
+
+        let Some(step) = task.claim(&mut tx, lease).await? else {
+            tx.commit().await.map_err(db_error!("save error"))?;
+            return Ok(None);
+        };
+        tx.commit().await.map_err(db_error!("mark running"))?;
+        Ok(Some((task, step, lease)))
+    }
+
+    /// Waits until the next task is ready, marks it running and returns it.
+    /// Returns `None` if the worker is stopped
+    #[cfg(test)]
+    async fn recv_task(&self, lease: TaskLease) -> Result<Option<(Task, S, TaskLease)>> {
+        trace!("Receiving the next task");
+
+        loop {
+            match self.wait_for_available_task().await? {
+                TaskAvailability::Ready => {}
+                TaskAvailability::Stopped => return Ok(None),
+            }
+
+            if let Some(task) = self.claim_available_task(lease).await? {
+                return Ok(Some(task));
+            }
         }
     }
 
@@ -564,7 +615,8 @@ impl<S: Step<S> + 'static> Worker<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatEvent, RunEvents, Worker, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TIMEOUT,
+        HeartbeatEvent, RunEvents, TaskAvailability, Worker, DEFAULT_HEARTBEAT_INTERVAL,
+        DEFAULT_LEASE_TIMEOUT,
     };
     use crate::{task::TaskLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -1459,6 +1511,31 @@ mod tests {
             }
             _ => panic!("expected a pool-closed begin error"),
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn wait_for_available_task_does_not_claim_ready_tasks(pool: PgPool) {
+        let id = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let worker = Worker::<TestTask>::new(pool.clone());
+
+        let availability = worker.wait_for_available_task().await.unwrap();
+
+        assert!(matches!(availability, TaskAvailability::Ready));
+        let lease = sqlx::query!(
+            "SELECT locked_by, lock_expires_at FROM pg_task WHERE id = $1",
+            id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(lease.locked_by.is_none());
+        assert!(lease.lock_expires_at.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
