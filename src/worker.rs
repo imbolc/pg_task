@@ -28,6 +28,11 @@ enum HeartbeatEvent {
     Expired(Error),
 }
 
+struct RunEvents {
+    heartbeat: mpsc::UnboundedReceiver<HeartbeatEvent>,
+    step_errors: mpsc::UnboundedReceiver<Error>,
+}
+
 /// A worker for processing tasks
 pub struct Worker<T> {
     db: PgPool,
@@ -183,7 +188,10 @@ impl<S: Step<S> + 'static> Worker<S> {
             heartbeat,
             running_steps,
             abort_running_steps,
-            heartbeat_events,
+            RunEvents {
+                heartbeat: heartbeat_events,
+                step_errors,
+            },
         )
         .await
     }
@@ -413,7 +421,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         heartbeat: tokio::task::AbortHandle,
         running_steps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
         abort_running_steps: bool,
-        heartbeat_events: mpsc::UnboundedReceiver<HeartbeatEvent>,
+        events: RunEvents,
     ) -> Result<()> {
         self.listener.shutdown();
         if abort_running_steps {
@@ -427,10 +435,15 @@ impl<S: Step<S> + 'static> Worker<S> {
             result
         } else {
             match self
-                .wait_for_steps_to_finish_or_heartbeat(semaphore.clone(), heartbeat_events)
+                .wait_for_steps_to_finish_or_events(
+                    semaphore.clone(),
+                    events.heartbeat,
+                    events.step_errors,
+                    result,
+                )
                 .await
             {
-                Ok(()) => result,
+                Ok(result) => result,
                 Err(error) => {
                     Self::abort_running_steps(&running_steps);
                     self.wait_for_steps_to_finish(semaphore).await;
@@ -446,21 +459,27 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     async fn wait_for_steps_to_finish(&self, semaphore: Arc<Semaphore>) {
-        self.wait_for_steps_to_finish_impl(semaphore, None)
+        self.wait_for_steps_to_finish_impl(semaphore, None, None, Ok(()))
             .await
-            .expect("waiting without heartbeat events cannot fail");
+            .expect("waiting without event receivers cannot fail")
+            .expect("waiting without step errors cannot fail");
     }
 
     async fn wait_for_steps_to_finish_impl(
         &self,
         semaphore: Arc<Semaphore>,
         mut heartbeat_events: Option<mpsc::UnboundedReceiver<HeartbeatEvent>>,
-    ) -> Result<()> {
+        mut step_errors: Option<mpsc::UnboundedReceiver<Error>>,
+        mut result: Result<()>,
+    ) -> Result<Result<()>> {
         let mut logged_tasks_left = None;
         let mut heartbeat_healthy = true;
         loop {
             let tasks_left = self.concurrency.get() - semaphore.available_permits();
             if tasks_left == 0 {
+                if let Some(step_errors) = step_errors.as_mut() {
+                    Self::record_step_errors(step_errors, &mut result);
+                }
                 break;
             }
             if let Some(logged) = logged_tasks_left {
@@ -471,36 +490,82 @@ impl<S: Step<S> + 'static> Worker<S> {
                 info!("Waiting for the current steps of {tasks_left} tasks to finish...");
             }
             logged_tasks_left = Some(tasks_left);
-            if let Some(heartbeat_events) = heartbeat_events.as_mut() {
-                tokio::select! {
-                    Some(event) = heartbeat_events.recv() => {
-                        Self::handle_heartbeat_event(event, &mut heartbeat_healthy)?;
+            match (heartbeat_events.as_mut(), step_errors.as_mut()) {
+                (Some(heartbeat_events), Some(step_errors)) => {
+                    tokio::select! {
+                        Some(event) = heartbeat_events.recv() => {
+                            Self::handle_heartbeat_event(event, &mut heartbeat_healthy)?;
+                        }
+                        Some(error) = step_errors.recv() => {
+                            Self::record_step_error(error, &mut result);
+                        }
+                        _ = sleep(Duration::from_secs_f32(0.1)) => {}
                     }
-                    _ = sleep(Duration::from_secs_f32(0.1)) => {}
                 }
-            } else {
-                sleep(Duration::from_secs_f32(0.1)).await;
+                (Some(heartbeat_events), None) => {
+                    tokio::select! {
+                        Some(event) = heartbeat_events.recv() => {
+                            Self::handle_heartbeat_event(event, &mut heartbeat_healthy)?;
+                        }
+                        _ = sleep(Duration::from_secs_f32(0.1)) => {}
+                    }
+                }
+                (None, Some(step_errors)) => {
+                    tokio::select! {
+                        Some(error) = step_errors.recv() => {
+                            Self::record_step_error(error, &mut result);
+                        }
+                        _ = sleep(Duration::from_secs_f32(0.1)) => {}
+                    }
+                }
+                (None, None) => {
+                    sleep(Duration::from_secs_f32(0.1)).await;
+                }
             }
         }
         if logged_tasks_left.is_some() {
             trace!("The current step of every task is done")
         }
-        Ok(())
+        Ok(result)
     }
 
-    async fn wait_for_steps_to_finish_or_heartbeat(
+    fn record_step_errors(
+        step_errors: &mut mpsc::UnboundedReceiver<Error>,
+        result: &mut Result<()>,
+    ) {
+        while let Ok(error) = step_errors.try_recv() {
+            Self::record_step_error(error, result);
+        }
+    }
+
+    fn record_step_error(error: Error, result: &mut Result<()>) {
+        if result.is_ok() {
+            *result = Err(error);
+        }
+    }
+
+    async fn wait_for_steps_to_finish_or_events(
         &self,
         semaphore: Arc<Semaphore>,
         heartbeat_events: mpsc::UnboundedReceiver<HeartbeatEvent>,
-    ) -> Result<()> {
-        self.wait_for_steps_to_finish_impl(semaphore, Some(heartbeat_events))
-            .await
+        step_errors: mpsc::UnboundedReceiver<Error>,
+        result: Result<()>,
+    ) -> Result<Result<()>> {
+        self.wait_for_steps_to_finish_impl(
+            semaphore,
+            Some(heartbeat_events),
+            Some(step_errors),
+            result,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HeartbeatEvent, Worker, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TIMEOUT};
+    use super::{
+        HeartbeatEvent, RunEvents, Worker, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TIMEOUT,
+    };
     use crate::{task::TaskLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
     use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -865,6 +930,18 @@ mod tests {
     fn idle_heartbeat_events() -> mpsc::UnboundedReceiver<HeartbeatEvent> {
         let (_sender, receiver) = mpsc::unbounded_channel();
         receiver
+    }
+
+    fn idle_step_errors() -> mpsc::UnboundedReceiver<Error> {
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        receiver
+    }
+
+    fn idle_run_events() -> RunEvents {
+        RunEvents {
+            heartbeat: idle_heartbeat_events(),
+            step_errors: idle_step_errors(),
+        }
     }
 
     async fn connect_to_current_db(
@@ -1865,7 +1942,7 @@ mod tests {
                         idle_heartbeat(),
                         Arc::new(Mutex::new(Vec::new())),
                         false,
-                        idle_heartbeat_events(),
+                        idle_run_events(),
                     )
                     .await
             }
@@ -1881,6 +1958,57 @@ mod tests {
             err,
             Error::ListenerReceive(sqlx::Error::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn finish_run_returns_step_errors_received_while_draining() {
+        init_tracing();
+        let worker = Arc::new(
+            Worker::<TestTask>::new(
+                PgPoolOptions::new()
+                    .connect_lazy("postgres:///pg_task")
+                    .unwrap(),
+            )
+            .with_concurrency(nonzero(1)),
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (step_error_sender, step_errors) = mpsc::unbounded_channel();
+
+        let finish = tokio::spawn({
+            let worker = worker.clone();
+            let semaphore = semaphore.clone();
+            async move {
+                worker
+                    .finish_run(
+                        Ok(()),
+                        semaphore,
+                        idle_heartbeat(),
+                        Arc::new(Mutex::new(Vec::new())),
+                        false,
+                        RunEvents {
+                            heartbeat: idle_heartbeat_events(),
+                            step_errors,
+                        },
+                    )
+                    .await
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!finish.is_finished());
+
+        step_error_sender
+            .send(Error::Db(sqlx::Error::PoolTimedOut, "step".into()))
+            .unwrap();
+        drop(permit);
+
+        let err = timeout(Duration::from_secs(1), finish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
     }
 
     #[tokio::test]
@@ -1912,7 +2040,7 @@ mod tests {
                         heartbeat_abort,
                         Arc::new(Mutex::new(Vec::new())),
                         false,
-                        idle_heartbeat_events(),
+                        idle_run_events(),
                     )
                     .await
             }
@@ -1957,7 +2085,7 @@ mod tests {
                 idle_heartbeat(),
                 running_steps,
                 true,
-                idle_heartbeat_events(),
+                idle_run_events(),
             ),
         )
         .await
@@ -1997,7 +2125,10 @@ mod tests {
                 idle_heartbeat(),
                 running_steps,
                 false,
-                heartbeat_events,
+                RunEvents {
+                    heartbeat: heartbeat_events,
+                    step_errors: idle_step_errors(),
+                },
             ),
         )
         .await
@@ -2313,6 +2444,39 @@ mod tests {
 
         assert_eq!(state.state().events(), vec!["started", "completed"]);
         assert_eq!(task_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_returns_step_errors_received_after_stop_while_draining(pool: PgPool) {
+        let state = StepStateGuard::new();
+        insert_task(
+            &pool,
+            &TestTask::Blocking(Blocking { key: state.key() }),
+            false,
+        )
+        .await;
+
+        let worker = spawn_worker_with_concurrency(pool.clone(), 2);
+
+        state.state().wait_for_events(1).await;
+        stop_worker(&pool).await;
+        sleep(Duration::from_millis(50)).await;
+        assert!(!worker.is_finished());
+
+        sqlx::query!("ALTER TABLE pg_task RENAME COLUMN id TO task_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        state.state().release();
+
+        let err = timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(state.state().events(), vec!["started", "completed"]);
+        assert!(matches!(err, Error::Db(sqlx::Error::Database(_), _)));
     }
 
     #[sqlx::test(migrations = "./migrations")]

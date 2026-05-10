@@ -5,7 +5,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{
-    postgres::{PgConnection, PgPool},
+    postgres::{types::PgInterval, PgConnection, PgPool},
     PgExecutor,
 };
 use std::{fmt, time::Duration};
@@ -22,19 +22,21 @@ pub struct Task {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TaskLease {
     worker_id: Uuid,
-    timeout: chrono::Duration,
+    timeout: PgInterval,
 }
 
 impl TaskLease {
     pub(crate) fn new(worker_id: Uuid, timeout: Duration) -> Self {
+        let microseconds = timeout.as_nanos().saturating_add(999) / 1_000;
+        let microseconds = microseconds.min(i64::MAX as u128) as i64;
         Self {
             worker_id,
-            timeout: std_duration_to_chrono(timeout),
+            timeout: PgInterval {
+                months: 0,
+                days: 0,
+                microseconds,
+            },
         }
-    }
-
-    fn expires_at(self) -> DateTime<Utc> {
-        Utc::now() + self.timeout
     }
 }
 
@@ -107,12 +109,12 @@ impl Task {
             r#"
             UPDATE pg_task
             SET locked_by = $2,
-                lock_expires_at = $3
+                lock_expires_at = now() + $3::interval
             WHERE id = $1
             "#,
             self.id,
             lease.worker_id,
-            lease.expires_at(),
+            lease.timeout,
         )
         .execute(con)
         .await
@@ -126,13 +128,13 @@ impl Task {
         sqlx::query!(
             r#"
             UPDATE pg_task
-            SET lock_expires_at = $2
+            SET lock_expires_at = now() + $2::interval
             WHERE locked_by = $1
               AND lock_expires_at > now()
               AND error IS NULL
             "#,
             lease.worker_id,
-            lease.expires_at(),
+            lease.timeout,
         )
         .execute(db)
         .await
@@ -840,9 +842,9 @@ mod tests {
     async fn claim_marks_valid_steps_leased(pool: PgPool) {
         let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
 
+        let started_at = Utc::now();
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
-        let started_at = Utc::now();
         let claimed = task.claim::<TestTask>(&mut tx, task_lease()).await.unwrap();
         tx.commit().await.unwrap();
         let finished_at = Utc::now();
