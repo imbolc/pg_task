@@ -129,6 +129,7 @@ impl Task {
             SET lock_expires_at = $2
             WHERE locked_by = $1
               AND lock_expires_at > now()
+              AND error IS NULL
             "#,
             lease.worker_id,
             lease.expires_at(),
