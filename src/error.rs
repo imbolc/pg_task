@@ -21,6 +21,8 @@ pub enum Error {
     ListenerReceive(#[source] sqlx::Error),
     /// unreachable: worker semaphore is closed
     UnreachableWorkerSemaphoreClosed(#[source] tokio::sync::AcquireError),
+    /// task lease expired before the worker could renew it
+    TaskLeaseExpired,
     /// db error: {1}
     Db(#[source] sqlx::Error, String),
 }
@@ -47,6 +49,10 @@ mod tests {
         assert_eq!(
             Error::ListenerReceive(sqlx::Error::PoolClosed).to_string(),
             "listener can't receive table change notifications",
+        );
+        assert_eq!(
+            Error::TaskLeaseExpired.to_string(),
+            "task lease expired before the worker could renew it",
         );
     }
 }

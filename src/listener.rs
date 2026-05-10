@@ -567,6 +567,7 @@ mod tests {
     async fn listen_wakes_subscribers_for_task_updates_and_deletes(pool: PgPool) {
         let listener = Listener::new();
         listener.listen(pool.clone()).await.unwrap();
+        let insert_subscription = listener.subscribe();
         let id = sqlx::query!(
             "INSERT INTO pg_task (step, wakeup_at) VALUES ($1, $2) RETURNING id",
             "{}",
@@ -576,6 +577,9 @@ mod tests {
         .await
         .unwrap()
         .id;
+        timeout(Duration::from_secs(1), insert_subscription.wait_forever())
+            .await
+            .unwrap();
 
         let update_subscription = listener.subscribe();
         sqlx::query!("UPDATE pg_task SET error = $2 WHERE id = $1", id, "boom",)

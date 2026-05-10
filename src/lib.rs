@@ -271,7 +271,12 @@ The workers would wait until the current step of all the tasks is finished and
 then exit. You can wait for this by checking for the existence of running tasks:
 
 ```sql
-SELECT EXISTS(SELECT 1 FROM pg_task WHERE locked_by IS NOT NULL);
+SELECT EXISTS(
+    SELECT 1
+    FROM pg_task
+    WHERE locked_by IS NOT NULL
+      AND lock_expires_at > now()
+);
 ```
 
 ### Delaying Steps

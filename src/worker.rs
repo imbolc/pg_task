@@ -92,23 +92,30 @@ impl<S: Step<S> + 'static> Worker<S> {
         let (step_error_sender, mut step_errors) = mpsc::unbounded_channel();
         let mut heartbeat_healthy = true;
         let mut abort_running_steps = false;
+        let mut reserved_permit = None;
 
         let result = loop {
             let received = tokio::select! {
                 biased;
 
                 Some(error) = step_errors.recv() => {
+                    drop(reserved_permit.take());
                     break Err(error);
                 }
                 Some(event) = heartbeat_events.recv() => {
                     if let Err(error) = Self::handle_heartbeat_event(event, &mut heartbeat_healthy) {
                         abort_running_steps = true;
+                        drop(reserved_permit.take());
                         break Err(error);
+                    }
+                    if !heartbeat_healthy {
+                        drop(reserved_permit.take());
                     }
                     continue;
                 }
                 _ = sleep(LOCKED_TASK_RECHECK_DELAY), if !heartbeat_healthy => {
                     if self.listener.time_to_stop_worker() {
+                        drop(reserved_permit.take());
                         break Ok(());
                     }
                     if let Some(error) = self.listener.take_error() {
@@ -121,20 +128,23 @@ impl<S: Step<S> + 'static> Worker<S> {
                             )
                             .await
                         {
+                            drop(reserved_permit.take());
                             break Err(error);
                         }
                     }
                     continue;
                 }
-                received = self.recv_task(), if heartbeat_healthy => received,
+                permit = semaphore.clone().acquire_owned(), if heartbeat_healthy && reserved_permit.is_none() => {
+                    reserved_permit = Some(permit.map_err(Error::UnreachableWorkerSemaphoreClosed)?);
+                    continue;
+                }
+                received = self.recv_task(), if heartbeat_healthy && reserved_permit.is_some() => received,
             };
             match received {
                 Ok(Some((task, step, lease))) => {
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(Error::UnreachableWorkerSemaphoreClosed)?;
+                    let permit = reserved_permit
+                        .take()
+                        .expect("task fetching requires a reserved semaphore permit");
                     let db = self.db.clone();
                     let step_error_sender = step_error_sender.clone();
                     let step = tokio::spawn(async move {
@@ -147,9 +157,11 @@ impl<S: Step<S> + 'static> Worker<S> {
                     Self::track_running_step(&running_steps, step.abort_handle());
                 }
                 Ok(None) => {
+                    drop(reserved_permit.take());
                     break Ok(());
                 }
                 Err(e) => {
+                    drop(reserved_permit.take());
                     if let Err(error) = self
                         .handle_recv_task_error_or_heartbeat(
                             e,
@@ -159,6 +171,7 @@ impl<S: Step<S> + 'static> Worker<S> {
                         )
                         .await
                     {
+                        drop(reserved_permit.take());
                         break Err(error);
                     }
                 }
@@ -170,6 +183,7 @@ impl<S: Step<S> + 'static> Worker<S> {
             heartbeat,
             running_steps,
             abort_running_steps,
+            heartbeat_events,
         )
         .await
     }
@@ -306,11 +320,24 @@ impl<S: Step<S> + 'static> Worker<S> {
                             renewal_failed = false;
                         }
                     }
-                    Ok(_) => {
+                    Ok(_) if !Self::has_running_steps(&running_steps) => {
                         last_renewed_at = Instant::now();
                         if renewal_failed {
                             let _ = events.send(HeartbeatEvent::Recovered);
                             renewal_failed = false;
+                        }
+                    }
+                    Ok(_) => {
+                        warn!("Task lease renewal updated no rows while steps are still running");
+                        if !renewal_failed {
+                            let _ = events.send(HeartbeatEvent::Failed);
+                            renewal_failed = true;
+                        }
+                        if last_renewed_at.elapsed().saturating_add(heartbeat_interval)
+                            >= lease_timeout
+                        {
+                            let _ = events.send(HeartbeatEvent::Expired(Error::TaskLeaseExpired));
+                            break;
                         }
                     }
                     Err(error) => {
@@ -371,6 +398,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         heartbeat: tokio::task::AbortHandle,
         running_steps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
         abort_running_steps: bool,
+        heartbeat_events: mpsc::UnboundedReceiver<HeartbeatEvent>,
     ) -> Result<()> {
         self.listener.shutdown();
         if abort_running_steps {
@@ -379,7 +407,22 @@ impl<S: Step<S> + 'static> Worker<S> {
         }
         // Drain in-flight steps before returning so a restarted worker can't
         // reclaim them as stale while they are still running.
-        self.wait_for_steps_to_finish(semaphore).await;
+        let result = if abort_running_steps {
+            self.wait_for_steps_to_finish(semaphore).await;
+            result
+        } else {
+            match self
+                .wait_for_steps_to_finish_or_heartbeat(semaphore.clone(), heartbeat_events)
+                .await
+            {
+                Ok(()) => result,
+                Err(error) => {
+                    Self::abort_running_steps(&running_steps);
+                    self.wait_for_steps_to_finish(semaphore).await;
+                    Err(error)
+                }
+            }
+        };
         heartbeat.abort();
         if result.is_ok() {
             info!("Stopped");
@@ -407,6 +450,39 @@ impl<S: Step<S> + 'static> Worker<S> {
         if logged_tasks_left.is_some() {
             trace!("The current step of every task is done")
         }
+    }
+
+    async fn wait_for_steps_to_finish_or_heartbeat(
+        &self,
+        semaphore: Arc<Semaphore>,
+        mut heartbeat_events: mpsc::UnboundedReceiver<HeartbeatEvent>,
+    ) -> Result<()> {
+        let mut logged_tasks_left = None;
+        let mut heartbeat_healthy = true;
+        loop {
+            let tasks_left = self.concurrency.get() - semaphore.available_permits();
+            if tasks_left == 0 {
+                break;
+            }
+            if let Some(logged) = logged_tasks_left {
+                if logged != tasks_left {
+                    trace!("Waiting for the current steps of {tasks_left} tasks to finish...");
+                }
+            } else {
+                info!("Waiting for the current steps of {tasks_left} tasks to finish...");
+            }
+            logged_tasks_left = Some(tasks_left);
+            tokio::select! {
+                Some(event) = heartbeat_events.recv() => {
+                    Self::handle_heartbeat_event(event, &mut heartbeat_healthy)?;
+                }
+                _ = sleep(Duration::from_secs_f32(0.1)) => {}
+            }
+        }
+        if logged_tasks_left.is_some() {
+            trace!("The current step of every task is done")
+        }
+        Ok(())
     }
 }
 
@@ -774,6 +850,11 @@ mod tests {
         .abort_handle()
     }
 
+    fn idle_heartbeat_events() -> mpsc::UnboundedReceiver<HeartbeatEvent> {
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        receiver
+    }
+
     async fn connect_to_current_db(
         pool: &PgPool,
         max_connections: u32,
@@ -993,6 +1074,38 @@ mod tests {
             .is_err());
 
         heartbeat.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn heartbeat_expires_when_running_steps_have_no_live_leases(pool: PgPool) {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(pool)
+            .with_lease_timeout(Duration::from_millis(80))
+            .with_heartbeat_interval(Duration::from_millis(20));
+        let running_step = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let (events, mut events_receiver) = mpsc::unbounded_channel();
+        let heartbeat = worker.spawn_heartbeat(events, running_steps);
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Failed));
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            HeartbeatEvent::Expired(Error::TaskLeaseExpired)
+        ));
+
+        heartbeat.abort();
+        running_step.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1698,6 +1811,7 @@ mod tests {
                         idle_heartbeat(),
                         Arc::new(Mutex::new(Vec::new())),
                         false,
+                        idle_heartbeat_events(),
                     )
                     .await
             }
@@ -1744,6 +1858,7 @@ mod tests {
                         heartbeat_abort,
                         Arc::new(Mutex::new(Vec::new())),
                         false,
+                        idle_heartbeat_events(),
                     )
                     .await
             }
@@ -1788,6 +1903,7 @@ mod tests {
                 idle_heartbeat(),
                 running_steps,
                 true,
+                idle_heartbeat_events(),
             ),
         )
         .await
@@ -1795,6 +1911,46 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::Db(sqlx::Error::PoolTimedOut, _)));
+        assert!(running_step.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn finish_run_aborts_inflight_steps_when_heartbeat_expires_while_draining() {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgres:///pg_task")
+                .unwrap(),
+        )
+        .with_concurrency(nonzero(1));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let running_step = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let (heartbeat_events_sender, heartbeat_events) = mpsc::unbounded_channel();
+        heartbeat_events_sender
+            .send(HeartbeatEvent::Expired(Error::TaskLeaseExpired))
+            .unwrap();
+
+        let err = timeout(
+            Duration::from_secs(1),
+            worker.finish_run(
+                Ok(()),
+                semaphore,
+                idle_heartbeat(),
+                running_steps,
+                false,
+                heartbeat_events,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(matches!(err, Error::TaskLeaseExpired));
         assert!(running_step.await.unwrap_err().is_cancelled());
     }
 
