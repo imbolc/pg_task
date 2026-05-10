@@ -402,7 +402,7 @@ impl Task {
 
     fn log_lost_lease(&self, worker_id: Uuid, action: &str) {
         warn!(
-            "[{}] couldn't {action} because worker {worker_id} no longer owns the task",
+            "[{}] couldn't {action} because worker {worker_id}'s lease expired or is no longer owned by this worker",
             self.id
         );
     }
