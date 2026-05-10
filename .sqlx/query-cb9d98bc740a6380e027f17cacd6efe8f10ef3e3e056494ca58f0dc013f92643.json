@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT locked_by, lock_expires_at\n            FROM pg_task\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "locked_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "lock_expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "cb9d98bc740a6380e027f17cacd6efe8f10ef3e3e056494ca58f0dc013f92643"
+}

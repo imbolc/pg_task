@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ALTER TABLE pg_task RENAME COLUMN wakeup_at TO scheduled_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "0e27da7580e82a38a7fb3d0d7ab2d39daffaa7f4394c4b50e69db37f9d24a376"
+}

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tried, locked_by, lock_expires_at, error FROM pg_task WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tried",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "locked_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "lock_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "error",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "d50ef96acf789ca4e715dfaec291895da495a64ff6719724150b1f939617971a"
+}

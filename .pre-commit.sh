@@ -31,5 +31,5 @@ cargo +nightly fmt -- --check
 cargo sort -c
 cargo test --all-targets
 cargo test --doc
-cargo sqlx prepare && git add .sqlx
+cargo sqlx prepare -- --all-targets && git add .sqlx
 cargo clippy --all-targets -- -D warnings

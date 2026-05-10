@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "NOTIFY pg_task_changed, 'wake'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "9cc24e2538c05af994fb2cbed6cc83580f50abe7a2a90a95331255e20ee20682"
+}
