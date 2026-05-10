@@ -33,6 +33,11 @@ struct RunEvents {
     step_errors: mpsc::UnboundedReceiver<Error>,
 }
 
+struct RunningStep {
+    task_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+}
+
 enum TaskAvailability {
     Ready,
     Stopped,
@@ -158,6 +163,7 @@ impl<S: Step<S> + 'static> Worker<S> {
                             .expect("task claiming requires a reserved semaphore permit");
                         let db = self.db.clone();
                         let step_error_sender = step_error_sender.clone();
+                        let task_id = task.id;
                         let step = tokio::spawn(async move {
                             if let Err(e) = task.run_step(&db, step, lease).await {
                                 error!("[{}] {}", task.id, source_chain::to_string(&e));
@@ -165,7 +171,7 @@ impl<S: Step<S> + 'static> Worker<S> {
                             };
                             drop(permit);
                         });
-                        Self::track_running_step(&running_steps, step.abort_handle());
+                        Self::track_running_step(&running_steps, task_id, step.abort_handle());
                     }
                     Ok(None) => continue,
                     Err(e) => {
@@ -362,7 +368,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     fn spawn_heartbeat(
         &self,
         events: mpsc::UnboundedSender<HeartbeatEvent>,
-        running_steps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+        running_steps: Arc<Mutex<Vec<RunningStep>>>,
         lease: TaskLease,
     ) -> tokio::task::AbortHandle {
         self.validate_lease_timing();
@@ -377,7 +383,8 @@ impl<S: Step<S> + 'static> Worker<S> {
             heartbeat.tick().await;
             loop {
                 heartbeat.tick().await;
-                if !Self::has_running_steps(&running_steps) {
+                let running_task_ids = Self::running_task_ids(&running_steps);
+                if running_task_ids.is_empty() {
                     last_renewed_at = Instant::now();
                     if renewal_failed {
                         let _ = events.send(HeartbeatEvent::Recovered);
@@ -385,24 +392,27 @@ impl<S: Step<S> + 'static> Worker<S> {
                     }
                     continue;
                 }
-                match Task::renew_leases(&db, lease).await {
-                    Ok(renewed) if renewed > 0 => {
-                        trace!("Renewed {renewed} task leases");
+                match Task::renew_leases(&db, lease, &running_task_ids).await {
+                    Ok(renewed_task_ids)
+                        if Self::renewed_all_running_leases(
+                            &running_task_ids,
+                            &renewed_task_ids,
+                            &running_steps,
+                        ) =>
+                    {
+                        trace!("Renewed {} task leases", renewed_task_ids.len());
                         last_renewed_at = Instant::now();
                         if renewal_failed {
                             let _ = events.send(HeartbeatEvent::Recovered);
                             renewal_failed = false;
                         }
                     }
-                    Ok(_) if !Self::has_running_steps(&running_steps) => {
-                        last_renewed_at = Instant::now();
-                        if renewal_failed {
-                            let _ = events.send(HeartbeatEvent::Recovered);
-                            renewal_failed = false;
-                        }
-                    }
-                    Ok(_) => {
-                        warn!("Task lease renewal updated no rows while steps are still running");
+                    Ok(renewed_task_ids) => {
+                        warn!(
+                            "Task lease renewal updated {} of {} running task leases",
+                            renewed_task_ids.len(),
+                            running_task_ids.len()
+                        );
                         if !renewal_failed {
                             let _ = events.send(HeartbeatEvent::Failed);
                             renewal_failed = true;
@@ -423,7 +433,7 @@ impl<S: Step<S> + 'static> Worker<S> {
                             let _ = events.send(HeartbeatEvent::Failed);
                             renewal_failed = true;
                         }
-                        if Self::has_running_steps(&running_steps)
+                        if !Self::running_task_ids(&running_steps).is_empty()
                             && last_renewed_at.elapsed().saturating_add(heartbeat_interval)
                                 >= lease_timeout
                         {
@@ -438,31 +448,51 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     fn track_running_step(
-        running_steps: &Mutex<Vec<tokio::task::AbortHandle>>,
-        step: tokio::task::AbortHandle,
+        running_steps: &Mutex<Vec<RunningStep>>,
+        task_id: Uuid,
+        abort_handle: tokio::task::AbortHandle,
     ) {
         let mut running_steps = running_steps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        running_steps.retain(|step| !step.is_finished());
-        running_steps.push(step);
+        running_steps.retain(|step| !step.abort_handle.is_finished());
+        running_steps.push(RunningStep {
+            task_id,
+            abort_handle,
+        });
     }
 
-    fn abort_running_steps(running_steps: &Mutex<Vec<tokio::task::AbortHandle>>) {
+    fn abort_running_steps(running_steps: &Mutex<Vec<RunningStep>>) {
         let running_steps = running_steps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for step in &*running_steps {
-            step.abort();
+            step.abort_handle.abort();
         }
     }
 
-    fn has_running_steps(running_steps: &Mutex<Vec<tokio::task::AbortHandle>>) -> bool {
-        running_steps
+    #[cfg(test)]
+    fn has_running_steps(running_steps: &Mutex<Vec<RunningStep>>) -> bool {
+        !Self::running_task_ids(running_steps).is_empty()
+    }
+
+    fn running_task_ids(running_steps: &Mutex<Vec<RunningStep>>) -> Vec<Uuid> {
+        let mut running_steps = running_steps
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|step| !step.is_finished())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running_steps.retain(|step| !step.abort_handle.is_finished());
+        running_steps.iter().map(|step| step.task_id).collect()
+    }
+
+    fn renewed_all_running_leases(
+        running_task_ids: &[Uuid],
+        renewed_task_ids: &[Uuid],
+        running_steps: &Mutex<Vec<RunningStep>>,
+    ) -> bool {
+        let still_running_task_ids = Self::running_task_ids(running_steps);
+        running_task_ids.iter().all(|task_id| {
+            renewed_task_ids.contains(task_id) || !still_running_task_ids.contains(task_id)
+        })
     }
 
     async fn finish_run(
@@ -470,7 +500,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         result: Result<()>,
         semaphore: Arc<Semaphore>,
         heartbeat: tokio::task::AbortHandle,
-        running_steps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+        running_steps: Arc<Mutex<Vec<RunningStep>>>,
         abort_running_steps: bool,
         events: RunEvents,
     ) -> Result<()> {
@@ -615,8 +645,8 @@ impl<S: Step<S> + 'static> Worker<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatEvent, RunEvents, TaskAvailability, Worker, DEFAULT_HEARTBEAT_INTERVAL,
-        DEFAULT_LEASE_TIMEOUT,
+        HeartbeatEvent, RunEvents, RunningStep, TaskAvailability, Worker,
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TIMEOUT,
     };
     use crate::{task::TaskLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -941,6 +971,15 @@ mod tests {
     }
 
     async fn set_task_lease(pool: &PgPool, id: Uuid, lock_expires_at: chrono::DateTime<Utc>) {
+        set_task_lease_for_worker(pool, id, Uuid::from_u128(1), lock_expires_at).await;
+    }
+
+    async fn set_task_lease_for_worker(
+        pool: &PgPool,
+        id: Uuid,
+        worker_id: Uuid,
+        lock_expires_at: chrono::DateTime<Utc>,
+    ) {
         sqlx::query!(
             r#"
             UPDATE pg_task
@@ -949,7 +988,7 @@ mod tests {
             WHERE id = $1
             "#,
             id,
-            Uuid::from_u128(1),
+            worker_id,
             lock_expires_at,
         )
         .execute(pool)
@@ -1035,6 +1074,13 @@ mod tests {
 
     fn worker_lease(worker: &Worker<TestTask>) -> TaskLease {
         TaskLease::new(Uuid::new_v4(), worker.lease_timeout)
+    }
+
+    fn running_step_entry(task_id: Uuid, abort_handle: tokio::task::AbortHandle) -> RunningStep {
+        RunningStep {
+            task_id,
+            abort_handle,
+        }
     }
 
     fn spawn_worker(pool: PgPool) -> tokio::task::JoinHandle<crate::Result<()>> {
@@ -1255,7 +1301,10 @@ mod tests {
         let running_step = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let running_steps = Arc::new(Mutex::new(vec![running_step_entry(
+            Uuid::new_v4(),
+            running_step.abort_handle(),
+        )]));
         let (events, mut events_receiver) = mpsc::unbounded_channel();
         let heartbeat = worker.spawn_heartbeat(events, running_steps, worker_lease(&worker));
 
@@ -1276,6 +1325,75 @@ mod tests {
 
         heartbeat.abort();
         running_step.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn heartbeat_expires_when_any_running_step_loses_its_lease(pool: PgPool) {
+        init_tracing();
+        let worker = Worker::<TestTask>::new(pool.clone())
+            .with_lease_timeout(Duration::from_millis(80))
+            .with_heartbeat_interval(Duration::from_millis(20));
+        let worker_id = Uuid::new_v4();
+        let lease = TaskLease::new(worker_id, worker.lease_timeout);
+        let live = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        let expired = insert_task_at(
+            &pool,
+            &TestTask::Noop(Noop),
+            Utc::now() - ChronoDuration::milliseconds(1),
+            false,
+        )
+        .await;
+        set_task_lease_for_worker(
+            &pool,
+            live,
+            worker_id,
+            Utc::now() + ChronoDuration::milliseconds(200),
+        )
+        .await;
+        set_task_lease_for_worker(
+            &pool,
+            expired,
+            worker_id,
+            Utc::now() - ChronoDuration::milliseconds(1),
+        )
+        .await;
+        let live_step = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let expired_step = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let running_steps = Arc::new(Mutex::new(vec![
+            running_step_entry(live, live_step.abort_handle()),
+            running_step_entry(expired, expired_step.abort_handle()),
+        ]));
+        let (events, mut events_receiver) = mpsc::unbounded_channel();
+        let heartbeat = worker.spawn_heartbeat(events, running_steps, lease);
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HeartbeatEvent::Failed));
+
+        let event = timeout(Duration::from_secs(1), events_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            HeartbeatEvent::Expired(Error::TaskLeaseExpired)
+        ));
+
+        heartbeat.abort();
+        live_step.abort();
+        expired_step.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1336,7 +1454,10 @@ mod tests {
         let running_step = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let running_steps = Arc::new(Mutex::new(vec![running_step_entry(
+            id,
+            running_step.abort_handle(),
+        )]));
         let (events, mut events_receiver) = mpsc::unbounded_channel();
         let heartbeat = worker.spawn_heartbeat(events, running_steps, lease);
 
@@ -1371,9 +1492,12 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let running_step_abort = running_step.abort_handle();
-        let running_steps = Mutex::new(vec![finished_step_abort]);
+        let running_steps = Mutex::new(vec![running_step_entry(
+            Uuid::new_v4(),
+            finished_step_abort,
+        )]);
 
-        Worker::<TestTask>::track_running_step(&running_steps, running_step_abort);
+        Worker::<TestTask>::track_running_step(&running_steps, Uuid::new_v4(), running_step_abort);
 
         assert_eq!(
             running_steps
@@ -2152,7 +2276,10 @@ mod tests {
             let _permit = permit;
             std::future::pending::<()>().await;
         });
-        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let running_steps = Arc::new(Mutex::new(vec![running_step_entry(
+            Uuid::new_v4(),
+            running_step.abort_handle(),
+        )]));
 
         let err = timeout(
             Duration::from_secs(1),
@@ -2188,7 +2315,10 @@ mod tests {
             let _permit = permit;
             std::future::pending::<()>().await;
         });
-        let running_steps = Arc::new(Mutex::new(vec![running_step.abort_handle()]));
+        let running_steps = Arc::new(Mutex::new(vec![running_step_entry(
+            Uuid::new_v4(),
+            running_step.abort_handle(),
+        )]));
         let (heartbeat_events_sender, heartbeat_events) = mpsc::unbounded_channel();
         heartbeat_events_sender
             .send(HeartbeatEvent::Expired(Error::TaskLeaseExpired))

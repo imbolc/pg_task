@@ -13,10 +13,6 @@ ADD CONSTRAINT pg_task_lease_state_check CHECK (
     OR (locked_by IS NOT NULL AND lock_expires_at IS NOT NULL)
 );
 
-CREATE INDEX pg_task_lock_expires_at_idx ON pg_task (lock_expires_at)
-WHERE locked_by IS NOT NULL
-  AND error IS NULL;
-
 ALTER TABLE pg_task DROP COLUMN is_running;
 
 COMMENT ON COLUMN pg_task.locked_by IS 'Worker currently owning the running step lease';

@@ -122,23 +122,33 @@ impl Task {
         Ok(())
     }
 
-    /// Renews all live task leases owned by a worker.
-    pub(crate) async fn renew_leases(db: &PgPool, lease: TaskLease) -> Result<u64> {
+    /// Renews live task leases owned by a worker.
+    pub(crate) async fn renew_leases(
+        db: &PgPool,
+        lease: TaskLease,
+        task_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         trace!("Renewing task leases for worker {}", lease.worker_id);
         sqlx::query!(
             r#"
             UPDATE pg_task
             SET lock_expires_at = now() + $2::interval
             WHERE locked_by = $1
+              AND id = ANY($3)
               AND lock_expires_at > now()
               AND error IS NULL
+            RETURNING id
             "#,
             lease.worker_id,
             lease.timeout,
+            task_ids,
         )
-        .execute(db)
+        .fetch_all(db)
         .await
-        .map(|result| result.rows_affected())
+        .map(|rows| rows.into_iter().map(|row| row.id).collect())
         .map_err(db_error!("renew leases"))
     }
 
@@ -308,8 +318,6 @@ impl Task {
             Ok(x) => x,
             Err(e) => return self.save_step_error(db, e.into(), true, lease).await,
         };
-        debug!("[{}] moved to the next step {step}", self.id);
-
         let result = sqlx::query!(
             "
             UPDATE pg_task
@@ -332,6 +340,8 @@ impl Task {
         .map_err(db_error!())?;
         if result.rows_affected() == 0 {
             self.log_lost_lease(lease.worker_id, "save the next step");
+        } else {
+            debug!("[{}] moved to the next step {step}", self.id);
         }
         Ok(())
     }
@@ -370,12 +380,6 @@ impl Task {
         lease: TaskLease,
     ) -> Result<()> {
         let delay = std_duration_to_chrono(delay);
-        debug!(
-            "[{id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {err}",
-            id = self.id,
-            attempt = ordinal(tried + 1),
-            err = source_chain::to_string(&*err),
-        );
 
         let result = sqlx::query!(
             "
@@ -397,6 +401,13 @@ impl Task {
         .map_err(db_error!())?;
         if result.rows_affected() == 0 {
             self.log_lost_lease(lease.worker_id, "schedule a retry");
+        } else {
+            debug!(
+                "[{id}] scheduled {attempt} of {retry_limit} retries in {delay:?} on error: {err}",
+                id = self.id,
+                attempt = ordinal(tried + 1),
+                err = source_chain::to_string(&*err),
+            );
         }
 
         Ok(())
@@ -942,10 +953,12 @@ mod tests {
         .await;
 
         let started_at = Utc::now();
-        let renewed = Task::renew_leases(&pool, task_lease()).await.unwrap();
+        let renewed = Task::renew_leases(&pool, task_lease(), &[owned, expired, other_worker])
+            .await
+            .unwrap();
         let finished_at = Utc::now();
 
-        assert_eq!(renewed, 1);
+        assert_eq!(renewed, vec![owned]);
         let owned = fetch_task_row(&pool, owned).await.unwrap();
         assert_timestamp_between(
             owned.lock_expires_at.unwrap(),
@@ -995,7 +1008,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(Task::renew_leases(&pool, task_lease()).await.unwrap(), 0);
+        assert!(
+            Task::renew_leases(&pool, task_lease(), &[expired, other_worker])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

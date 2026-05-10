@@ -1,5 +1,3 @@
-DROP INDEX pg_task_lock_expires_at_idx;
-
 CREATE INDEX pg_task_locked_by_idx
 ON pg_task (locked_by)
 WHERE locked_by IS NOT NULL
