@@ -107,7 +107,10 @@ mod tests {
         ordinal, std_duration_to_chrono, wait_for_reconnection,
     };
     use chrono::Duration as ChronoDuration;
-    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use sqlx::{
+        postgres::{PgConnectOptions, PgPoolOptions},
+        PgPool,
+    };
     use std::{io, time::Duration};
 
     #[test]
@@ -215,7 +218,7 @@ mod tests {
         let retry_pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_millis(20))
-            .connect(&format!("postgres:///{db_name}"))
+            .connect_with(current_database_options(&db_name))
             .await
             .unwrap();
         let held_connection = retry_pool.acquire().await.unwrap();
@@ -230,5 +233,16 @@ mod tests {
         drop(held_connection);
 
         waiter.await.unwrap().unwrap();
+    }
+
+    // Connect to the database created by sqlx::test while keeping the
+    // connection settings from DATABASE_URL. CI needs its TCP host and password;
+    // postgres:///{db_name} only works for local peer-auth socket setups.
+    fn current_database_options(db_name: &str) -> PgConnectOptions {
+        std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set")
+            .parse::<PgConnectOptions>()
+            .unwrap()
+            .database(db_name)
     }
 }

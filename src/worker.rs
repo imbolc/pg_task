@@ -650,7 +650,10 @@ mod tests {
     };
     use crate::{task::TaskLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
-    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use sqlx::{
+        postgres::{PgConnectOptions, PgPoolOptions},
+        PgPool,
+    };
     use std::{
         collections::HashMap,
         io,
@@ -1048,9 +1051,20 @@ mod tests {
         PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(acquire_timeout)
-            .connect(&format!("postgres:///{db_name}"))
+            .connect_with(current_database_options(&db_name))
             .await
             .unwrap()
+    }
+
+    // Connect to the database created by sqlx::test while keeping the
+    // connection settings from DATABASE_URL. CI needs its TCP host and password;
+    // postgres:///{db_name} only works for local peer-auth socket setups.
+    fn current_database_options(db_name: &str) -> PgConnectOptions {
+        std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set")
+            .parse::<PgConnectOptions>()
+            .unwrap()
+            .database(db_name)
     }
 
     async fn task_count(pool: &PgPool) -> i64 {

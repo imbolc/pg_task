@@ -37,7 +37,7 @@ mod tests {
             .await
             .unwrap();
 
-        std::env::set_var("DATABASE_URL", format!("postgres:///{db_name}"));
+        std::env::set_var("DATABASE_URL", current_database_url(&db_name));
         std::env::remove_var("RUST_LOG");
 
         let db = init().await.unwrap();
@@ -51,5 +51,24 @@ mod tests {
             .fetch_optional(&db)
             .await
             .unwrap();
+    }
+
+    // Point DATABASE_URL at the database created by sqlx::test while keeping
+    // the original host, user, password, and query parameters. CI connects over
+    // TCP with password auth, so postgres:///{db_name} would lose credentials.
+    fn current_database_url(db_name: &str) -> String {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let (url, query) = database_url
+            .split_once('?')
+            .map_or((database_url.as_str(), None), |(url, query)| {
+                (url, Some(query))
+            });
+        let (prefix, _) = url.rsplit_once('/').unwrap();
+        let mut current_database_url = format!("{prefix}/{db_name}");
+        if let Some(query) = query {
+            current_database_url.push('?');
+            current_database_url.push_str(query);
+        }
+        current_database_url
     }
 }
