@@ -82,6 +82,12 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install sqlx-cli
+        run: cargo install --locked sqlx-cli --version 0.8.6 --no-default-features --features postgres,rustls
+
+      - name: Run migrations
+        run: cargo sqlx migrate run
+
       - name: Test all targets
         run: cargo test --all-targets
 
