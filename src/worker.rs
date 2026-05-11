@@ -670,6 +670,10 @@ mod tests {
     };
     use uuid::Uuid;
 
+    // Short enough to exercise PoolTimedOut, but long enough for CI to open
+    // the first TCP connection before the pool is intentionally exhausted.
+    const POOL_TIMEOUT: Duration = Duration::from_millis(100);
+
     fn init_tracing() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -1413,7 +1417,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn heartbeat_skips_pool_timeouts_without_running_steps(pool: PgPool) {
         init_tracing();
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let held_connection = worker_pool.acquire().await.unwrap();
         let worker = Worker::<TestTask>::new(worker_pool)
             .with_lease_timeout(Duration::from_millis(500))
@@ -1436,7 +1440,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn heartbeat_reports_recovery_after_live_leases_are_renewed(pool: PgPool) {
         init_tracing();
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let held_connection = worker_pool.acquire().await.unwrap();
         let worker = Worker::<TestTask>::new(worker_pool)
             .with_lease_timeout(Duration::from_millis(500))
@@ -1984,7 +1988,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_pauses_fetching_while_heartbeat_cannot_renew(pool: PgPool) {
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let state = StepStateGuard::new();
 
         let worker = tokio::spawn(async move {
@@ -2018,7 +2022,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_returns_listener_errors_while_fetching_is_paused(pool: PgPool) {
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let worker = Arc::new(
             Worker::<TestTask>::new(worker_pool)
                 .with_concurrency(nonzero(1))
@@ -2050,7 +2054,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_keeps_waiting_after_retryable_errors_while_fetching_is_paused(pool: PgPool) {
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let worker = Arc::new(
             Worker::<TestTask>::new(worker_pool)
                 .with_concurrency(nonzero(1))
@@ -2080,7 +2084,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_resumes_fetching_after_heartbeat_recovers(pool: PgPool) {
-        let worker_pool = connect_to_current_db(&pool, 2, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 2, POOL_TIMEOUT).await;
         let held_connection = worker_pool.acquire().await.unwrap();
         let state = StepStateGuard::new();
 
@@ -2443,7 +2447,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn run_recovers_from_pool_timeouts_until_a_stop_notification_arrives(pool: PgPool) {
-        let worker_pool = connect_to_current_db(&pool, 1, Duration::from_millis(20)).await;
+        let worker_pool = connect_to_current_db(&pool, 1, POOL_TIMEOUT).await;
         let worker = spawn_worker(worker_pool);
 
         sleep(Duration::from_millis(100)).await;

@@ -113,6 +113,10 @@ mod tests {
     };
     use std::{io, time::Duration};
 
+    // Short enough to exercise PoolTimedOut, but long enough for CI to open
+    // the first TCP connection before the pool is intentionally exhausted.
+    const POOL_TIMEOUT: Duration = Duration::from_millis(100);
+
     #[test]
     fn chrono_duration_to_std_uses_the_absolute_value() {
         let duration = ChronoDuration::seconds(-1) - ChronoDuration::milliseconds(250);
@@ -217,7 +221,7 @@ mod tests {
             .unwrap();
         let retry_pool = PgPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(Duration::from_millis(20))
+            .acquire_timeout(POOL_TIMEOUT)
             .connect_with(current_database_options(&db_name))
             .await
             .unwrap();
