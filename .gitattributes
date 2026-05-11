@@ -4,3 +4,6 @@
 
 # Exclude from `git grep`
 /.sqlx/*.* binary
+
+# Mark it as generated so GitHub collapses it in PR diffs/reviews
+.sqlx/** linguist-generated=true
