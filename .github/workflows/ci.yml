@@ -6,9 +6,6 @@ on:
       - ci
   pull_request:
 
-env:
-  SQLX_OFFLINE: true
-
 jobs:
   rustfmt:
     runs-on: ubuntu-latest
@@ -27,6 +24,8 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,6 +41,8 @@ jobs:
 
   rustdoc:
     runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
