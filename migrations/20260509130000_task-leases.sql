@@ -1,13 +1,10 @@
+-- Add lease related columns
 ALTER TABLE pg_task
 ADD COLUMN locked_by UUID,
 ADD COLUMN lock_expires_at timestamptz;
 
-DROP TRIGGER pg_task_changed ON pg_task;
-
-UPDATE pg_task
-SET locked_by = gen_random_uuid(),
-    lock_expires_at = now()
-WHERE is_running = true;
+COMMENT ON COLUMN pg_task.locked_by IS 'Worker currently owning the running step lease';
+COMMENT ON COLUMN pg_task.lock_expires_at IS 'Time when the running step lease expires and can be reclaimed';
 
 ALTER TABLE pg_task
 ADD CONSTRAINT pg_task_lease_state_check CHECK (
@@ -15,10 +12,37 @@ ADD CONSTRAINT pg_task_lease_state_check CHECK (
     OR (locked_by IS NOT NULL AND lock_expires_at IS NOT NULL)
 );
 
+CREATE INDEX pg_task_locked_by_idx
+ON pg_task (locked_by)
+WHERE locked_by IS NOT NULL
+  AND error IS NULL;
+
+CREATE INDEX pg_task_next_available_at_idx
+ON pg_task ((
+    CASE
+        WHEN locked_by IS NOT NULL THEN
+            GREATEST(wakeup_at, lock_expires_at)
+        ELSE
+            wakeup_at
+    END
+))
+WHERE error IS NULL;
+
+-- Remove `running_at` column
+UPDATE pg_task
+SET locked_by = gen_random_uuid(),
+    lock_expires_at = now()
+WHERE is_running = true;
+
 ALTER TABLE pg_task DROP COLUMN is_running;
 
-COMMENT ON COLUMN pg_task.locked_by IS 'Worker currently owning the running step lease';
-COMMENT ON COLUMN pg_task.lock_expires_at IS 'Time when the running step lease expires and can be reclaimed';
+-- Update trigger
+--
+-- The old trigger in migrations/20230714025134_trigger.sql:9 fired on every INSERT or UPDATE.
+-- With leases, that became too noisy because heartbeat renewal updates only lock_expires_at.
+-- If the old trigger stayed, every lease renewal would NOTIFY pg_task_changed,
+-- waking waiting workers even though no new task became claimable.
+DROP TRIGGER pg_task_changed ON pg_task;
 
 CREATE OR REPLACE FUNCTION pg_task_notify_on_change()
 RETURNS trigger AS $$
@@ -43,6 +67,7 @@ ON pg_task
 FOR EACH ROW
 EXECUTE PROCEDURE pg_task_notify_on_change();
 
+-- The new trigger only notifies on updates to fields that affect task state or claimability.
 CREATE TRIGGER pg_task_changed_update
 AFTER UPDATE
 ON pg_task
@@ -55,19 +80,3 @@ WHEN (
     OR OLD.locked_by IS DISTINCT FROM NEW.locked_by
 )
 EXECUTE PROCEDURE pg_task_notify_on_change();
-
-CREATE INDEX pg_task_locked_by_idx
-ON pg_task (locked_by)
-WHERE locked_by IS NOT NULL
-  AND error IS NULL;
-
-CREATE INDEX pg_task_next_available_at_idx
-ON pg_task ((
-    CASE
-        WHEN locked_by IS NOT NULL THEN
-            GREATEST(wakeup_at, lock_expires_at)
-        ELSE
-            wakeup_at
-    END
-))
-WHERE error IS NULL;
