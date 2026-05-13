@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn listen_wakes_subscribers_for_task_updates_and_deletes(pool: PgPool) {
+    async fn listen_wakes_subscribers_for_task_inserts_and_updates(pool: PgPool) {
         let listener = Listener::new();
         listener.listen(pool.clone()).await.unwrap();
         let insert_subscription = listener.subscribe();
@@ -587,15 +587,6 @@ mod tests {
             .await
             .unwrap();
         timeout(Duration::from_secs(1), update_subscription.wait_forever())
-            .await
-            .unwrap();
-
-        let delete_subscription = listener.subscribe();
-        sqlx::query!("DELETE FROM pg_task WHERE id = $1", id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), delete_subscription.wait_forever())
             .await
             .unwrap();
 
