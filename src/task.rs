@@ -66,9 +66,21 @@ impl Task {
                 tried
             FROM pg_task
             WHERE error IS NULL
-              AND wakeup_at <= now()
-              AND (locked_by IS NULL OR lock_expires_at <= now())
-            ORDER BY wakeup_at
+              AND (
+                CASE
+                    WHEN locked_by IS NOT NULL THEN
+                        GREATEST(wakeup_at, lock_expires_at)
+                    ELSE
+                        wakeup_at
+                END
+              ) <= now()
+            ORDER BY
+                CASE
+                    WHEN locked_by IS NOT NULL THEN
+                        GREATEST(wakeup_at, lock_expires_at)
+                    ELSE
+                        wakeup_at
+                END
             LIMIT 1
             FOR UPDATE SKIP LOCKED
             "#,
