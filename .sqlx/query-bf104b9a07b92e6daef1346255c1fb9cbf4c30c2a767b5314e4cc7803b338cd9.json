@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "NOTIFY pg_task_changed, 'stop_worker'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "bf104b9a07b92e6daef1346255c1fb9cbf4c30c2a767b5314e4cc7803b338cd9"
+}

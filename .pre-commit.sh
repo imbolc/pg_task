@@ -29,7 +29,11 @@ typos .
 cargo shear
 cargo +nightly fmt -- --check
 cargo sort -c
-cargo test --all-targets
-cargo test --doc
-cargo sqlx prepare && git add .sqlx
-cargo clippy --all-targets -- -D warnings
+
+cargo sqlx prepare -- --all-targets --all-features
+# `cargo sqlx prepare` uses `cargo check`, which misses query macros compiled only by test harnesses.
+SQLX_OFFLINE=false SQLX_OFFLINE_DIR=.sqlx cargo test --all-targets --all-features --no-run
+git add .sqlx
+SQLX_OFFLINE=true cargo test --all-targets
+SQLX_OFFLINE=true cargo test --doc
+SQLX_OFFLINE=true cargo clippy --all-targets --all-features -- -D warnings

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ALTER TABLE pg_task ADD CONSTRAINT reject_errors CHECK (error IS NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "419e27727faf579f041c979d5fddae1a16d5c691dc05aa5a4852434180516b1e"
+}

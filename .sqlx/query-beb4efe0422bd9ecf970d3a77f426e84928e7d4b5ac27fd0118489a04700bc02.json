@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT step, wakeup_at FROM pg_task WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "step",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "wakeup_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "beb4efe0422bd9ecf970d3a77f426e84928e7d4b5ac27fd0118489a04700bc02"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ALTER TABLE pg_task RENAME COLUMN lock_expires_at TO task_lock_expires_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "e4688afeb7fb77e0e5961ac1650dc35efc017db15316c1b2e1ab8320988f9b83"
+}

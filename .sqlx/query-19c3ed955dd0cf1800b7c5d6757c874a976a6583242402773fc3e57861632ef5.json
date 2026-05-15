@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ALTER TABLE pg_task RENAME COLUMN locked_by TO task_locked_by",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "19c3ed955dd0cf1800b7c5d6757c874a976a6583242402773fc3e57861632ef5"
+}

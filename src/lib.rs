@@ -6,7 +6,7 @@ FSM-based Resumable Postgres tasks
 - **FSM-based** - each task is a granular state machine
 - **Resumable** - on error, after you fix the step logic or the external world,
   the task is able to pick up where it stopped
-- **Postgres** - a single table is enough to handle task scheduling, state
+- **Postgres** - a single table handles task scheduling, state
   transitions, and error processing
 
 ## Table of Contents
@@ -101,8 +101,7 @@ impl Step<Greeter> for SayHello {
 The second step prints the greeting and finishes the task returning
 `NextStep::none()`.
 
-That's essentially all, except for some boilerplate you can find in the [full
-code][tutorial-example]. Let's run it:
+The [full code][tutorial-example] includes the remaining setup. Run it with:
 
 ```bash
 cargo run --example tutorial
@@ -110,20 +109,21 @@ cargo run --example tutorial
 
 ### Investigating Errors
 
-You'll see log messages about the 6 (first try + `RETRY_LIMIT`) attempts and the
-final error message. Let's look into the DB to find out what happened:
+The example logs 6 attempts: the first try plus `RETRY_LIMIT` retries. Inspect
+the row to see what happened:
 
 ```bash
 ~$ psql pg_task -c 'table pg_task'
 -[ RECORD 1 ]------------------------------------------------
-id         | cddf7de1-1194-4bee-90c6-af73d9206ce2
-step       | {"Greeter":{"ReadName":{"filename":"name.txt"}}}
-wakeup_at  | 2024-06-30 09:32:27.703599+06
-tried      | 6
-is_running | f
-error      | No such file or directory (os error 2)
-created_at | 2024-06-30 09:32:22.628563+06
-updated_at | 2024-06-30 09:32:27.703599+06
+id              | cddf7de1-1194-4bee-90c6-af73d9206ce2
+step            | {"Greeter":{"ReadName":{"filename":"name.txt"}}}
+wakeup_at       | 2024-06-30 09:32:27.703599+06
+tried           | 6
+locked_by       |
+lock_expires_at |
+error           | No such file or directory (os error 2)
+created_at      | 2024-06-30 09:32:22.628563+06
+updated_at      | 2024-06-30 09:32:27.703599+06
 ```
 
 - a non-null `error` field indicates that the task has errored and contains the
@@ -133,29 +133,26 @@ updated_at | 2024-06-30 09:32:27.703599+06
 
 ### Fixing the World
 
-In this case, the error is due to the external world state. Let's fix it by
-creating the file:
+The task failed because the file is missing. Create it:
 
 ```bash
 echo 'Fixed World' >name.txt
 ```
 
-To rerun the task, we just need to clear its `error`:
+Clear `error` to rerun the task:
 
 ```bash
 psql pg_task -c 'update pg_task set error = null'
 ```
 
-You'll see the log messages about rerunning the task and the greeting message of
-the final step. That's all 🎉.
+The worker reruns the task and prints the greeting from the final step.
 
 ### Scheduling Tasks
 
-Essentially scheduling a task is done by inserting a corresponding row into the
-`pg_task` table. You can do it by hand from `psql` or code in any language.
+Scheduling a task means inserting a row into the `pg_task` table. You can do it
+from `psql` or from code in any language.
 
-There's also a few helpers to take care of the first step serialization and time
-scheduling:
+The crate also provides helpers for first-step serialization and scheduling:
 
 - [`enqueue`] - to run the task immediately
 - [`delay`] - to run it with a delay
@@ -254,23 +251,26 @@ pg_task::Worker::<Tasks>::new(db).run().await?;
 # }
 ```
 
-All the communication is synchronized by the DB, so it doesn't matter how or how
-many workers you run. It could be a separate process as well as in-process
-[`tokio::spawn`].
+Workers coordinate through Postgres, so you can run one or many of them, either
+in separate processes or with [`tokio::spawn`].
 
 ### Stopping Workers
 
-You can gracefully stop task runners by sending a notification using the DB:
+Gracefully stop workers by sending a notification through the database:
 
 ```sql
 SELECT pg_notify('pg_task_changed', 'stop_worker');
 ```
 
-The workers would wait until the current step of all the tasks is finished and
-then exit. You can wait for this by checking for the existence of running tasks:
+Workers finish their current steps before exiting. To wait for them, check for
+live leases:
 
 ```sql
-SELECT EXISTS(SELECT 1 FROM pg_task WHERE is_running = true);
+SELECT EXISTS(
+    SELECT 1
+    FROM pg_task
+    WHERE lock_expires_at > now()
+);
 ```
 
 ### Delaying Steps

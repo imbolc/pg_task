@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE pg_task\n            SET locked_by = $2,\n                lock_expires_at = now() + $3::interval\n            WHERE id = $1\n            RETURNING lock_expires_at AS \"lock_expires_at!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lock_expires_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Interval"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "2614ddc9b7ceb8e907d0eda7da8c5b5355e3caae84f7b6feee9c274b6f8717a5"
+}

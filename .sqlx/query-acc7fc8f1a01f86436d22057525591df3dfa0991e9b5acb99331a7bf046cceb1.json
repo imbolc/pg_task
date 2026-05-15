@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "ALTER TABLE pg_task RENAME COLUMN step TO task_step",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "acc7fc8f1a01f86436d22057525591df3dfa0991e9b5acb99331a7bf046cceb1"
+}

@@ -64,7 +64,14 @@ mod tests {
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     pub(super) struct Second;
 
-    crate::task!(MacroTask { First, Second });
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    pub(super) struct Third;
+
+    crate::task!(MacroTask {
+        First,
+        Second,
+        Third
+    });
     crate::scheduler!(MacroScheduler { MacroTask });
 
     #[async_trait::async_trait]
@@ -84,6 +91,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl crate::Step<MacroTask> for Third {
+        async fn step(self, _db: &PgPool) -> crate::StepResult<MacroTask> {
+            crate::NextStep::now(Second)
+        }
+    }
+
     fn assert_scheduler<T: crate::Scheduler>() {}
 
     #[test]
@@ -96,6 +110,19 @@ mod tests {
     #[test]
     fn scheduler_macro_implements_the_scheduler_trait() {
         assert_scheduler::<MacroScheduler>();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scheduler_macro_schedules_wrapped_tasks(pool: PgPool) {
+        let task = MacroScheduler::MacroTask(MacroTask::First(First));
+
+        let id = crate::enqueue(&pool, &task).await.unwrap();
+
+        let row = sqlx::query!("SELECT step FROM pg_task WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.step, serde_json::to_string(&task).unwrap());
     }
 
     #[tokio::test]
@@ -130,6 +157,20 @@ mod tests {
                 .await
                 .unwrap(),
             crate::NextStep::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_macro_forwards_immediate_steps() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres:///pg_task")
+            .unwrap();
+
+        assert!(matches!(
+            crate::Step::<MacroTask>::step(MacroTask::Third(Third), &pool)
+                .await
+                .unwrap(),
+            crate::NextStep::Now(MacroTask::Second(Second))
         ));
     }
 }

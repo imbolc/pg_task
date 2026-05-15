@@ -76,6 +76,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_allows_zero_delay_wakeups() {
+        let next = Sleep(0).step(&lazy_pool()).await.unwrap();
+
+        match next {
+            NextStep::Delayed(Sleeper::Wakeup(Wakeup(seconds)), delay) => {
+                assert_eq!(seconds, 0);
+                assert_eq!(delay, Duration::ZERO);
+            }
+            _ => panic!("expected the delayed wakeup step"),
+        }
+    }
+
+    #[tokio::test]
     async fn wakeup_finishes_the_task() {
         assert!(matches!(
             Wakeup(3).step(&lazy_pool()).await.unwrap(),
