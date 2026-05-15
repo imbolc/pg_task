@@ -273,7 +273,7 @@ impl Task {
     ) -> Result<()> {
         let err_str = source_chain::to_string(&*err);
         let tried_increment = if increment_tried { 1 } else { 0 };
-        let step = sqlx::query!(
+        let updated_task = sqlx::query!(
             r#"
             UPDATE pg_task
             SET tried = tried + $3,
@@ -295,7 +295,7 @@ impl Task {
         .await
         .map_err(db_error!())?;
 
-        let Some(row) = step else {
+        let Some(updated_task) = updated_task else {
             self.log_lost_lease(lease.worker_id, "save the step error");
             return Ok(());
         };
@@ -305,14 +305,14 @@ impl Task {
             error!(
                 "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
                 id = self.id,
-                step = row.step,
+                step = updated_task.step,
                 attempt = ordinal(attempt)
             );
         } else {
             error!(
                 "[{id}] couldn't deserialize step {step}: {err_str}",
                 id = self.id,
-                step = row.step
+                step = updated_task.step
             );
         }
 
