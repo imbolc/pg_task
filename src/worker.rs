@@ -1,6 +1,6 @@
 use crate::{
     listener::Listener,
-    task::{Task, TaskLease},
+    task::{Task, WorkerLease},
     util::{db_error, is_connection_error, is_pool_timeout, wait_for_reconnection},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
@@ -100,7 +100,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         self.validate_lease_timing();
         self.listener.listen(self.db.clone()).await?;
 
-        let lease = TaskLease::new(Uuid::new_v4(), self.lease_timeout);
+        let lease = WorkerLease::new(Uuid::new_v4(), self.lease_timeout);
         let semaphore = Arc::new(Semaphore::new(self.concurrency.get()));
         let running_steps = Arc::new(Mutex::new(Vec::new()));
         let (heartbeat_events_sender, mut heartbeat_events) = mpsc::unbounded_channel();
@@ -266,7 +266,10 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     /// Claims a currently available task and marks it running.
-    async fn claim_available_task(&self, lease: TaskLease) -> Result<Option<(Task, S, TaskLease)>> {
+    async fn claim_available_task(
+        &self,
+        lease: WorkerLease,
+    ) -> Result<Option<(Task, S, WorkerLease)>> {
         trace!("Claiming an available task");
         let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
@@ -286,7 +289,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     /// Waits until the next task is ready, marks it running and returns it.
     /// Returns `None` if the worker is stopped
     #[cfg(test)]
-    async fn recv_task(&self, lease: TaskLease) -> Result<Option<(Task, S, TaskLease)>> {
+    async fn recv_task(&self, lease: WorkerLease) -> Result<Option<(Task, S, WorkerLease)>> {
         trace!("Receiving the next task");
 
         loop {
@@ -370,7 +373,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         &self,
         events: mpsc::UnboundedSender<HeartbeatEvent>,
         running_steps: Arc<Mutex<Vec<RunningStep>>>,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> tokio::task::AbortHandle {
         self.validate_lease_timing();
         let db = self.db.clone();
@@ -643,7 +646,7 @@ mod tests {
         HeartbeatEvent, RunEvents, RunningStep, TaskAvailability, Worker,
         DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TIMEOUT,
     };
-    use crate::{task::TaskLease, Error, NextStep, Step};
+    use crate::{task::WorkerLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
     use parking_lot::Mutex;
     use sqlx::{
@@ -1063,8 +1066,8 @@ mod tests {
         NonZeroUsize::new(value).unwrap()
     }
 
-    fn worker_lease(worker: &Worker<TestTask>) -> TaskLease {
-        TaskLease::new(Uuid::new_v4(), worker.lease_timeout)
+    fn worker_lease(worker: &Worker<TestTask>) -> WorkerLease {
+        WorkerLease::new(Uuid::new_v4(), worker.lease_timeout)
     }
 
     fn running_step_entry(task_id: Uuid, abort_handle: tokio::task::AbortHandle) -> RunningStep {
@@ -1325,7 +1328,7 @@ mod tests {
             .with_lease_timeout(Duration::from_millis(80))
             .with_heartbeat_interval(Duration::from_millis(20));
         let worker_id = Uuid::new_v4();
-        let lease = TaskLease::new(worker_id, worker.lease_timeout);
+        let lease = WorkerLease::new(worker_id, worker.lease_timeout);
         let live = insert_task_at(
             &pool,
             &TestTask::Noop(Noop),
@@ -1419,7 +1422,7 @@ mod tests {
             .with_lease_timeout(Duration::from_millis(500))
             .with_heartbeat_interval(Duration::from_millis(20));
         let worker_id = Uuid::new_v4();
-        let lease = TaskLease::new(worker_id, worker.lease_timeout);
+        let lease = WorkerLease::new(worker_id, worker.lease_timeout);
         let id = insert_task_at(
             &pool,
             &TestTask::Noop(Noop),
@@ -1806,7 +1809,7 @@ mod tests {
         set_task_lease(&pool, id, Utc::now() - ChronoDuration::milliseconds(1)).await;
         let worker = Worker::<TestTask>::new(pool.clone());
         let worker_id = Uuid::new_v4();
-        let lease = TaskLease::new(worker_id, worker.lease_timeout);
+        let lease = WorkerLease::new(worker_id, worker.lease_timeout);
 
         let (task, step, _lease) = worker.recv_task(lease).await.unwrap().unwrap();
 

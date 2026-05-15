@@ -1,5 +1,5 @@
 use crate::{
-    util::{chrono_duration_to_std, db_error, ordinal, std_duration_to_chrono},
+    util::{db_error, ordinal, std_duration_to_chrono},
     Error, NextStep, Result, Step, StepError,
 };
 use chrono::{DateTime, Utc};
@@ -20,12 +20,12 @@ pub struct Task {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TaskLease {
+pub(crate) struct WorkerLease {
     worker_id: Uuid,
     timeout: PgInterval,
 }
 
-impl TaskLease {
+impl WorkerLease {
     pub(crate) fn new(worker_id: Uuid, timeout: Duration) -> Self {
         Self {
             worker_id,
@@ -46,12 +46,10 @@ fn duration_to_pg_interval(duration: Duration) -> PgInterval {
 impl Task {
     /// Returns a delay before a task should run at the given time.
     pub fn delay_until(wakeup_at: DateTime<Utc>) -> Option<Duration> {
-        let delay = wakeup_at - Utc::now();
-        if delay <= chrono::Duration::zero() {
-            None
-        } else {
-            Some(chrono_duration_to_std(delay))
-        }
+        (wakeup_at - Utc::now())
+            .to_std()
+            .ok()
+            .filter(|delay| !delay.is_zero())
     }
 
     /// Fetches the closest ready task to run.
@@ -117,7 +115,7 @@ impl Task {
     pub(crate) async fn mark_running(
         &self,
         con: &mut PgConnection,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<()> {
         trace!("[{}] mark running", self.id);
         sqlx::query!(
@@ -140,7 +138,7 @@ impl Task {
     /// Renews live task leases owned by a worker.
     pub(crate) async fn renew_leases(
         db: &PgPool,
-        lease: TaskLease,
+        lease: WorkerLease,
         task_ids: &[Uuid],
     ) -> Result<Vec<Uuid>> {
         if task_ids.is_empty() {
@@ -173,7 +171,7 @@ impl Task {
     pub(crate) async fn claim<S: Step<S>>(
         &self,
         con: &mut PgConnection,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<Option<S>> {
         let step = match self.parse_step() {
             Ok(step) => step,
@@ -192,7 +190,7 @@ impl Task {
         &self,
         db: &PgPool,
         step: S,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<()> {
         info!(
             "[{id}]{attempt} run step {step}",
@@ -269,7 +267,7 @@ impl Task {
         db: &PgPool,
         err: StepError,
         increment_tried: bool,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<()> {
         let err_str = source_chain::to_string(&*err);
         let tried_increment = if increment_tried { 1 } else { 0 };
@@ -325,7 +323,7 @@ impl Task {
         db: &PgPool,
         step: impl Serialize + fmt::Debug,
         delay: Duration,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<()> {
         let step = match serde_json::to_string(&step)
             .map_err(|e| Error::SerializeStep(e, format!("{step:?}")))
@@ -362,7 +360,7 @@ impl Task {
     }
 
     /// Removes the finished task
-    async fn complete(&self, db: &PgPool, lease: TaskLease) -> Result<()> {
+    async fn complete(&self, db: &PgPool, lease: WorkerLease) -> Result<()> {
         let result = sqlx::query!(
             r#"
             DELETE FROM pg_task
@@ -392,7 +390,7 @@ impl Task {
         retry_limit: i32,
         delay: Duration,
         err: StepError,
-        lease: TaskLease,
+        lease: WorkerLease,
     ) -> Result<()> {
         let delay = std_duration_to_chrono(delay);
 
@@ -438,7 +436,7 @@ impl Task {
 
 #[cfg(test)]
 mod tests {
-    use super::{Task, TaskLease};
+    use super::{Task, WorkerLease};
     use crate::{NextStep, Step};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use sqlx::PgPool;
@@ -614,25 +612,25 @@ mod tests {
         Uuid::from_u128(2)
     }
 
-    fn task_lease() -> TaskLease {
-        TaskLease::new(worker_id(), Duration::from_secs(60))
+    fn worker_lease() -> WorkerLease {
+        WorkerLease::new(worker_id(), Duration::from_secs(60))
     }
 
     #[test]
-    fn task_lease_converts_timeout_to_microsecond_interval() {
-        let lease = TaskLease::new(worker_id(), Duration::from_micros(42));
+    fn worker_lease_converts_timeout_to_microsecond_interval() {
+        let lease = WorkerLease::new(worker_id(), Duration::from_micros(42));
         assert_eq!(lease.timeout.microseconds, 42);
     }
 
     #[test]
-    fn task_lease_rounds_timeout_up_to_microseconds() {
-        let lease = TaskLease::new(worker_id(), Duration::from_nanos(1));
+    fn worker_lease_rounds_timeout_up_to_microseconds() {
+        let lease = WorkerLease::new(worker_id(), Duration::from_nanos(1));
         assert_eq!(lease.timeout.microseconds, 1);
     }
 
     #[test]
-    fn task_lease_saturates_large_timeouts() {
-        let lease = TaskLease::new(worker_id(), Duration::MAX);
+    fn worker_lease_saturates_large_timeouts() {
+        let lease = WorkerLease::new(worker_id(), Duration::MAX);
         assert_eq!(lease.timeout.microseconds, i64::MAX);
     }
 
@@ -706,12 +704,16 @@ mod tests {
         .unwrap();
     }
 
-    async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTask, TaskLease) {
+    async fn claim_task(
+        pool: &PgPool,
+        step: TestTask,
+        tried: i32,
+    ) -> (Task, TestTask, WorkerLease) {
         let id = insert_task(pool, &step, tried, false).await;
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
         assert_eq!(task.id, id);
-        let lease = task_lease();
+        let lease = worker_lease();
         let claimed = task
             .claim::<TestTask>(&mut tx, lease)
             .await
@@ -786,7 +788,7 @@ mod tests {
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
 
         assert!(task
-            .claim::<TestTask>(&mut tx, task_lease())
+            .claim::<TestTask>(&mut tx, worker_lease())
             .await
             .unwrap()
             .is_none());
@@ -859,7 +861,10 @@ mod tests {
             .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
-        let err = task.mark_running(&mut tx, task_lease()).await.unwrap_err();
+        let err = task
+            .mark_running(&mut tx, worker_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
@@ -875,7 +880,7 @@ mod tests {
 
         let mut tx = pool.begin().await.unwrap();
         let err = task
-            .claim::<TestTask>(&mut tx, task_lease())
+            .claim::<TestTask>(&mut tx, worker_lease())
             .await
             .unwrap_err();
 
@@ -889,7 +894,10 @@ mod tests {
         let started_at = Utc::now();
         let mut tx = pool.begin().await.unwrap();
         let task = Task::fetch_ready(&mut tx).await.unwrap().unwrap();
-        let claimed = task.claim::<TestTask>(&mut tx, task_lease()).await.unwrap();
+        let claimed = task
+            .claim::<TestTask>(&mut tx, worker_lease())
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
         let finished_at = Utc::now();
 
@@ -986,7 +994,7 @@ mod tests {
         .await;
 
         let started_at = Utc::now();
-        let renewed = Task::renew_leases(&pool, task_lease(), &[owned, expired, other_worker])
+        let renewed = Task::renew_leases(&pool, worker_lease(), &[owned, expired, other_worker])
             .await
             .unwrap();
         let finished_at = Utc::now();
@@ -1042,7 +1050,7 @@ mod tests {
         .await;
 
         assert!(
-            Task::renew_leases(&pool, task_lease(), &[expired, other_worker])
+            Task::renew_leases(&pool, worker_lease(), &[expired, other_worker])
                 .await
                 .unwrap()
                 .is_empty()
@@ -1374,7 +1382,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
+        let err = task
+            .run_step(&pool, step, worker_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
@@ -1473,7 +1484,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
+        let err = task
+            .run_step(&pool, step, worker_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
@@ -1533,7 +1547,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
+        let err = task
+            .run_step(&pool, step, worker_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
@@ -1599,7 +1616,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = task.run_step(&pool, step, task_lease()).await.unwrap_err();
+        let err = task
+            .run_step(&pool, step, worker_lease())
+            .await
+            .unwrap_err();
 
         assert_database_error(err);
     }
