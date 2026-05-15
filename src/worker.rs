@@ -1776,21 +1776,20 @@ mod tests {
             true,
         )
         .await;
-        set_task_lease(&pool, id, Utc::now() + ChronoDuration::milliseconds(100)).await;
+        let lock_expires_at = Utc::now() + ChronoDuration::seconds(1);
+        set_task_lease(&pool, id, lock_expires_at).await;
 
         let worker = Worker::<TestTask>::new(pool);
         let lease = worker_lease(&worker);
         let recv = tokio::spawn(async move { worker.recv_task(lease).await });
 
-        sleep(Duration::from_millis(50)).await;
-        assert!(!recv.is_finished());
-
-        let (task, step, _lease) = timeout(Duration::from_secs(1), recv)
+        let (task, step, _lease) = timeout(Duration::from_secs(2), recv)
             .await
             .unwrap()
             .unwrap()
             .unwrap()
             .unwrap();
+        assert!(Utc::now() >= lock_expires_at);
         assert_eq!(task.id, id);
         assert!(matches!(step, TestTask::Noop(Noop)));
     }
