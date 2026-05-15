@@ -273,7 +273,7 @@ async fn claim_task(pool: &PgPool, step: TestTask, tried: i32) -> (Task, TestTas
         .unwrap()
         .unwrap();
     tx.commit().await.unwrap();
-    (task, claimed, lease)
+    (task, claimed.step, lease)
 }
 
 async fn fetch_task_row(pool: &PgPool, id: Uuid) -> Option<TaskRow> {
@@ -445,7 +445,10 @@ async fn claim_marks_valid_steps_leased(pool: PgPool) {
     tx.commit().await.unwrap();
     let finished_at = Utc::now();
 
-    assert!(matches!(claimed, Some(TestTask::Valid(Valid))));
+    assert!(matches!(
+        claimed.map(|claimed| claimed.step),
+        Some(TestTask::Valid(Valid))
+    ));
 
     let row = fetch_task_row(&pool, id).await.unwrap();
     assert_eq!(row.step, serialized_step(&TestTask::Valid(Valid)));
@@ -543,7 +546,13 @@ async fn renew_leases_extends_only_live_owned_leases(pool: PgPool) {
         .unwrap();
     let finished_at = Utc::now();
 
-    assert_eq!(renewed, vec![owned]);
+    let renewed_task_ids: Vec<_> = renewed.iter().map(|lease| lease.task_id).collect();
+    assert_eq!(renewed_task_ids, vec![owned]);
+    assert_timestamp_between(
+        renewed[0].lock_expires_at,
+        started_at + ChronoDuration::seconds(60),
+        finished_at + ChronoDuration::seconds(61),
+    );
     let owned = fetch_task_row(&pool, owned).await.unwrap();
     assert_timestamp_between(
         owned.lock_expires_at.unwrap(),

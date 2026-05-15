@@ -1,17 +1,15 @@
 use crate::{
     listener::Listener,
-    task::{Task, WorkerLease},
-    util::{db_error, db_interruption, wait_for_reconnection, DbInterruption},
+    task::{RenewedTaskLease, Task, WorkerLease},
+    util::{
+        db_error, db_interruption, std_duration_to_chrono, wait_for_reconnection, DbInterruption,
+    },
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use sqlx::postgres::PgPool;
-use std::{
-    marker::PhantomData,
-    num::NonZeroUsize,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, Semaphore},
     time::{interval, sleep, MissedTickBehavior},
@@ -37,6 +35,7 @@ struct RunEvents {
 struct RunningStep {
     task_id: Uuid,
     abort_handle: tokio::task::AbortHandle,
+    lock_expires_at: DateTime<Utc>,
 }
 
 enum TaskAvailability {
@@ -158,7 +157,7 @@ impl<S: Step<S> + 'static> Worker<S> {
             };
             match availability {
                 Ok(TaskAvailability::Ready) => match self.claim_available_task(lease).await {
-                    Ok(Some((task, step, lease))) => {
+                    Ok(Some((task, step, lease, lock_expires_at))) => {
                         let permit = reserved_permit
                             .take()
                             .expect("task claiming requires a reserved semaphore permit");
@@ -172,7 +171,12 @@ impl<S: Step<S> + 'static> Worker<S> {
                             };
                             drop(permit);
                         });
-                        Self::track_running_step(&running_steps, task_id, step.abort_handle());
+                        Self::track_running_step(
+                            &running_steps,
+                            task_id,
+                            step.abort_handle(),
+                            lock_expires_at,
+                        );
                     }
                     Ok(None) => continue,
                     Err(e) => {
@@ -269,7 +273,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     async fn claim_available_task(
         &self,
         lease: WorkerLease,
-    ) -> Result<Option<(Task, S, WorkerLease)>> {
+    ) -> Result<Option<(Task, S, WorkerLease, DateTime<Utc>)>> {
         trace!("Claiming an available task");
         let mut tx = self.db.begin().await.map_err(db_error!("begin"))?;
 
@@ -278,18 +282,21 @@ impl<S: Step<S> + 'static> Worker<S> {
             return Ok(None);
         };
 
-        let Some(step) = task.claim(&mut tx, lease).await? else {
+        let Some(claimed) = task.claim(&mut tx, lease).await? else {
             tx.commit().await.map_err(db_error!("save error"))?;
             return Ok(None);
         };
-        tx.commit().await.map_err(db_error!("mark running"))?;
-        Ok(Some((task, step, lease)))
+        tx.commit().await.map_err(db_error!("claim lease"))?;
+        Ok(Some((task, claimed.step, lease, claimed.lock_expires_at)))
     }
 
     /// Waits until the next task is ready, claims its lease and returns it.
     /// Returns `None` if the worker is stopped
     #[cfg(test)]
-    async fn recv_task(&self, lease: WorkerLease) -> Result<Option<(Task, S, WorkerLease)>> {
+    async fn recv_task(
+        &self,
+        lease: WorkerLease,
+    ) -> Result<Option<(Task, S, WorkerLease, DateTime<Utc>)>> {
         trace!("Receiving the next task");
 
         loop {
@@ -386,17 +393,14 @@ impl<S: Step<S> + 'static> Worker<S> {
         let db = self.db.clone();
         let mut heartbeat = interval(self.heartbeat_interval);
         let heartbeat_interval = self.heartbeat_interval;
-        let lease_timeout = self.lease_timeout;
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::spawn(async move {
-            let mut last_renewed_at = Instant::now();
             let mut renewal_failed = false;
             heartbeat.tick().await;
             loop {
                 heartbeat.tick().await;
                 let running_task_ids = Self::running_task_ids(&running_steps);
                 if running_task_ids.is_empty() {
-                    last_renewed_at = Instant::now();
                     if renewal_failed {
                         let _ = events.send(HeartbeatEvent::Recovered);
                         renewal_failed = false;
@@ -404,33 +408,33 @@ impl<S: Step<S> + 'static> Worker<S> {
                     continue;
                 }
                 match Task::renew_leases(&db, lease, &running_task_ids).await {
-                    Ok(renewed_task_ids)
-                        if Self::renewed_all_running_leases(
+                    Ok(renewed_leases)
+                        if Self::update_running_lease_expirations(
                             &running_task_ids,
-                            &renewed_task_ids,
+                            &renewed_leases,
                             &running_steps,
                         ) =>
                     {
-                        trace!("Renewed {} task leases", renewed_task_ids.len());
-                        last_renewed_at = Instant::now();
+                        trace!("Renewed {} task leases", renewed_leases.len());
                         if renewal_failed {
                             let _ = events.send(HeartbeatEvent::Recovered);
                             renewal_failed = false;
                         }
                     }
-                    Ok(renewed_task_ids) => {
+                    Ok(renewed_leases) => {
                         warn!(
                             "Task lease renewal updated {} of {} running task leases",
-                            renewed_task_ids.len(),
+                            renewed_leases.len(),
                             running_task_ids.len()
                         );
                         if !renewal_failed {
                             let _ = events.send(HeartbeatEvent::Failed);
                             renewal_failed = true;
                         }
-                        if last_renewed_at.elapsed().saturating_add(heartbeat_interval)
-                            >= lease_timeout
-                        {
+                        if Self::running_lease_expires_before_next_heartbeat(
+                            &running_steps,
+                            heartbeat_interval,
+                        ) {
                             let _ = events.send(HeartbeatEvent::Expired(Error::TaskLeaseExpired));
                             break;
                         }
@@ -444,10 +448,10 @@ impl<S: Step<S> + 'static> Worker<S> {
                             let _ = events.send(HeartbeatEvent::Failed);
                             renewal_failed = true;
                         }
-                        if !Self::running_task_ids(&running_steps).is_empty()
-                            && last_renewed_at.elapsed().saturating_add(heartbeat_interval)
-                                >= lease_timeout
-                        {
+                        if Self::running_lease_expires_before_next_heartbeat(
+                            &running_steps,
+                            heartbeat_interval,
+                        ) {
                             let _ = events.send(HeartbeatEvent::Expired(error));
                             break;
                         }
@@ -462,12 +466,14 @@ impl<S: Step<S> + 'static> Worker<S> {
         running_steps: &Mutex<Vec<RunningStep>>,
         task_id: Uuid,
         abort_handle: tokio::task::AbortHandle,
+        lock_expires_at: DateTime<Utc>,
     ) {
         let mut running_steps = running_steps.lock();
         running_steps.retain(|step| !step.abort_handle.is_finished());
         running_steps.push(RunningStep {
             task_id,
             abort_handle,
+            lock_expires_at,
         });
     }
 
@@ -489,15 +495,43 @@ impl<S: Step<S> + 'static> Worker<S> {
         running_steps.iter().map(|step| step.task_id).collect()
     }
 
-    fn renewed_all_running_leases(
+    fn update_running_lease_expirations(
         running_task_ids: &[Uuid],
-        renewed_task_ids: &[Uuid],
+        renewed_leases: &[RenewedTaskLease],
         running_steps: &Mutex<Vec<RunningStep>>,
     ) -> bool {
-        let still_running_task_ids = Self::running_task_ids(running_steps);
-        running_task_ids.iter().all(|task_id| {
-            renewed_task_ids.contains(task_id) || !still_running_task_ids.contains(task_id)
-        })
+        let mut running_steps = running_steps.lock();
+        running_steps.retain(|step| !step.abort_handle.is_finished());
+        let mut all_running_leases_renewed = true;
+
+        for step in running_steps.iter_mut() {
+            if !running_task_ids.contains(&step.task_id) {
+                continue;
+            }
+
+            if let Some(renewed_lease) = renewed_leases
+                .iter()
+                .find(|renewed_lease| renewed_lease.task_id == step.task_id)
+            {
+                step.lock_expires_at = renewed_lease.lock_expires_at;
+            } else {
+                all_running_leases_renewed = false;
+            }
+        }
+
+        all_running_leases_renewed
+    }
+
+    fn running_lease_expires_before_next_heartbeat(
+        running_steps: &Mutex<Vec<RunningStep>>,
+        heartbeat_interval: Duration,
+    ) -> bool {
+        let next_heartbeat_at = Utc::now() + std_duration_to_chrono(heartbeat_interval);
+        let mut running_steps = running_steps.lock();
+        running_steps.retain(|step| !step.abort_handle.is_finished());
+        running_steps
+            .iter()
+            .any(|step| step.lock_expires_at <= next_heartbeat_at)
     }
 
     async fn finish_run(

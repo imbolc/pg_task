@@ -25,6 +25,18 @@ pub(crate) struct WorkerLease {
     timeout: PgInterval,
 }
 
+#[derive(Debug)]
+pub(crate) struct ClaimedStep<S> {
+    pub(crate) step: S,
+    pub(crate) lock_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RenewedTaskLease {
+    pub(crate) task_id: Uuid,
+    pub(crate) lock_expires_at: DateTime<Utc>,
+}
+
 impl WorkerLease {
     pub(crate) fn new(worker_id: Uuid, timeout: Duration) -> Self {
         Self {
@@ -116,7 +128,7 @@ impl Task {
         &self,
         con: &mut PgConnection,
         lease: WorkerLease,
-    ) -> Result<()> {
+    ) -> Result<DateTime<Utc>> {
         trace!("[{}] claim lease", self.id);
         sqlx::query!(
             r#"
@@ -124,15 +136,16 @@ impl Task {
             SET locked_by = $2,
                 lock_expires_at = now() + $3::interval
             WHERE id = $1
+            RETURNING lock_expires_at AS "lock_expires_at!"
             "#,
             self.id,
             lease.worker_id,
             lease.timeout,
         )
-        .execute(con)
+        .fetch_one(con)
         .await
-        .map_err(db_error!("claim lease"))?;
-        Ok(())
+        .map(|row| row.lock_expires_at)
+        .map_err(db_error!("claim lease"))
     }
 
     /// Renews live task leases owned by a worker.
@@ -140,7 +153,7 @@ impl Task {
         db: &PgPool,
         lease: WorkerLease,
         task_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>> {
+    ) -> Result<Vec<RenewedTaskLease>> {
         if task_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -153,7 +166,7 @@ impl Task {
               AND id = ANY($3)
               AND lock_expires_at > now()
               AND error IS NULL
-            RETURNING id
+            RETURNING id, lock_expires_at AS "lock_expires_at!"
             "#,
             lease.worker_id,
             lease.timeout,
@@ -161,7 +174,14 @@ impl Task {
         )
         .fetch_all(db)
         .await
-        .map(|rows| rows.into_iter().map(|row| row.id).collect())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| RenewedTaskLease {
+                    task_id: row.id,
+                    lock_expires_at: row.lock_expires_at,
+                })
+                .collect()
+        })
         .map_err(db_error!("renew leases"))
     }
 
@@ -172,7 +192,7 @@ impl Task {
         &self,
         con: &mut PgConnection,
         lease: WorkerLease,
-    ) -> Result<Option<S>> {
+    ) -> Result<Option<ClaimedStep<S>>> {
         let step = match self.parse_step() {
             Ok(step) => step,
             Err(e) => {
@@ -181,8 +201,11 @@ impl Task {
             }
         };
 
-        self.claim_lease(con, lease).await?;
-        Ok(Some(step))
+        let lock_expires_at = self.claim_lease(con, lease).await?;
+        Ok(Some(ClaimedStep {
+            step,
+            lock_expires_at,
+        }))
     }
 
     /// Runs the current step of the task to completion

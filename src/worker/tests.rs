@@ -427,9 +427,18 @@ fn worker_lease(worker: &Worker<TestTask>) -> WorkerLease {
 }
 
 fn running_step_entry(task_id: Uuid, abort_handle: tokio::task::AbortHandle) -> RunningStep {
+    running_step_entry_with_lease_expiry(task_id, abort_handle, Utc::now())
+}
+
+fn running_step_entry_with_lease_expiry(
+    task_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+    lock_expires_at: chrono::DateTime<Utc>,
+) -> RunningStep {
     RunningStep {
         task_id,
         abort_handle,
+        lock_expires_at,
     }
 }
 
@@ -714,8 +723,16 @@ async fn heartbeat_expires_when_any_running_step_loses_its_lease(pool: PgPool) {
         std::future::pending::<()>().await;
     });
     let running_steps = Arc::new(Mutex::new(vec![
-        running_step_entry(live, live_step.abort_handle()),
-        running_step_entry(expired, expired_step.abort_handle()),
+        running_step_entry_with_lease_expiry(
+            live,
+            live_step.abort_handle(),
+            Utc::now() + ChronoDuration::milliseconds(200),
+        ),
+        running_step_entry_with_lease_expiry(
+            expired,
+            expired_step.abort_handle(),
+            Utc::now() - ChronoDuration::milliseconds(1),
+        ),
     ]));
     let (events, mut events_receiver) = mpsc::unbounded_channel();
     let heartbeat = worker.spawn_heartbeat(events, running_steps, lease);
@@ -798,9 +815,10 @@ async fn heartbeat_reports_recovery_after_live_leases_are_renewed(pool: PgPool) 
     let running_step = tokio::spawn(async {
         std::future::pending::<()>().await;
     });
-    let running_steps = Arc::new(Mutex::new(vec![running_step_entry(
+    let running_steps = Arc::new(Mutex::new(vec![running_step_entry_with_lease_expiry(
         id,
         running_step.abort_handle(),
+        initial_expires_at,
     )]));
     let (events, mut events_receiver) = mpsc::unbounded_channel();
     let heartbeat = worker.spawn_heartbeat(events, running_steps, lease);
@@ -841,7 +859,12 @@ async fn running_step_tracking_prunes_finished_steps() {
         finished_step_abort,
     )]);
 
-    Worker::<TestTask>::track_running_step(&running_steps, Uuid::new_v4(), running_step_abort);
+    Worker::<TestTask>::track_running_step(
+        &running_steps,
+        Uuid::new_v4(),
+        running_step_abort,
+        Utc::now(),
+    );
 
     assert_eq!(running_steps.lock().len(), 1);
     assert!(Worker::<TestTask>::has_running_steps(&running_steps));
@@ -849,6 +872,28 @@ async fn running_step_tracking_prunes_finished_steps() {
     Worker::<TestTask>::abort_running_steps(&running_steps);
     assert!(running_step.await.unwrap_err().is_cancelled());
     assert!(!Worker::<TestTask>::has_running_steps(&running_steps));
+}
+
+#[tokio::test]
+async fn running_lease_expiry_uses_the_tracked_lock_expiry() {
+    let running_step = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    let running_steps = Mutex::new(vec![running_step_entry_with_lease_expiry(
+        Uuid::new_v4(),
+        running_step.abort_handle(),
+        Utc::now() + ChronoDuration::milliseconds(200),
+    )]);
+
+    assert!(
+        !Worker::<TestTask>::running_lease_expires_before_next_heartbeat(
+            &running_steps,
+            Duration::from_millis(20),
+        )
+    );
+
+    Worker::<TestTask>::abort_running_steps(&running_steps);
+    assert!(running_step.await.unwrap_err().is_cancelled());
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1069,7 +1114,7 @@ async fn recv_task_skips_invalid_tasks_and_returns_next_ready_task(pool: PgPool)
     let worker = Worker::<TestTask>::new(pool.clone());
     let lease = worker_lease(&worker);
 
-    let (task, step, _lease) = worker.recv_task(lease).await.unwrap().unwrap();
+    let (task, step, _lease, _lock_expires_at) = worker.recv_task(lease).await.unwrap().unwrap();
 
     assert_eq!(task.id, expected);
     assert!(matches!(step, TestTask::Noop(Noop)));
@@ -1110,7 +1155,7 @@ async fn recv_task_rechecks_locked_ready_tasks_without_notifications(pool: PgPoo
 
     tx.rollback().await.unwrap();
 
-    let (task, step, _lease) = timeout(Duration::from_secs(1), recv)
+    let (task, step, _lease, _lock_expires_at) = timeout(Duration::from_secs(1), recv)
         .await
         .unwrap()
         .unwrap()
@@ -1136,7 +1181,7 @@ async fn recv_task_rechecks_leased_tasks_when_their_lease_expires(pool: PgPool) 
     let lease = worker_lease(&worker);
     let recv = tokio::spawn(async move { worker.recv_task(lease).await });
 
-    let (task, step, _lease) = timeout(Duration::from_secs(2), recv)
+    let (task, step, _lease, _lock_expires_at) = timeout(Duration::from_secs(2), recv)
         .await
         .unwrap()
         .unwrap()
@@ -1161,7 +1206,7 @@ async fn recv_task_replaces_expired_lease_with_the_current_worker(pool: PgPool) 
     let worker_id = Uuid::new_v4();
     let lease = WorkerLease::new(worker_id, worker.lease_timeout);
 
-    let (task, step, _lease) = worker.recv_task(lease).await.unwrap().unwrap();
+    let (task, step, _lease, _lock_expires_at) = worker.recv_task(lease).await.unwrap().unwrap();
 
     assert_eq!(task.id, id);
     assert!(matches!(step, TestTask::Noop(Noop)));
@@ -1194,18 +1239,20 @@ async fn two_workers_claim_ready_tasks_once(pool: PgPool) {
     let first_recv = tokio::spawn(async move { first_worker.recv_task(first_lease).await });
     let second_recv = tokio::spawn(async move { second_worker.recv_task(second_lease).await });
 
-    let (first_task, first_step, _first_lease) = timeout(Duration::from_secs(1), first_recv)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let (second_task, second_step, _second_lease) = timeout(Duration::from_secs(1), second_recv)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let (first_task, first_step, _first_lease, _first_lock_expires_at) =
+        timeout(Duration::from_secs(1), first_recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    let (second_task, second_step, _second_lease, _second_lock_expires_at) =
+        timeout(Duration::from_secs(1), second_recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
     assert!(matches!(first_step, TestTask::Noop(Noop)));
     assert!(matches!(second_step, TestTask::Noop(Noop)));
