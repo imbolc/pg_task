@@ -16,8 +16,27 @@ pub fn ordinal(n: i32) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DbInterruption {
+    Connection,
+    PoolTimeout,
+    Permanent,
+}
+
+/// Classifies whether a SQLx error should interrupt database work permanently
+/// or be retried after waiting.
+pub(crate) fn db_interruption(error: &sqlx::Error) -> DbInterruption {
+    if is_connection_error(error) {
+        DbInterruption::Connection
+    } else if is_pool_timeout(error) {
+        DbInterruption::PoolTimeout
+    } else {
+        DbInterruption::Permanent
+    }
+}
+
 /// Returns true if the SQLx error points to a lost or unavailable connection.
-pub(crate) fn is_connection_error(error: &sqlx::Error) -> bool {
+fn is_connection_error(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Io(_) => true,
         sqlx::Error::Database(error) => is_retryable_database_error(
@@ -30,7 +49,7 @@ pub(crate) fn is_connection_error(error: &sqlx::Error) -> bool {
 
 /// Returns true if the SQLx error indicates that the pool has no free
 /// connections right now.
-pub(crate) fn is_pool_timeout(error: &sqlx::Error) -> bool {
+fn is_pool_timeout(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::PoolTimedOut)
 }
 
@@ -71,11 +90,15 @@ pub async fn wait_for_reconnection(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(error) if is_connection_error(&error) || is_pool_timeout(&error) => {
-                tracing::trace!("Waiting for a database connection to become available");
-                tokio::time::sleep(sleep).await;
-            }
-            Err(error) => return Err(db_error!("wait for reconnection")(error)),
+            Err(error) => match db_interruption(&error) {
+                DbInterruption::Connection | DbInterruption::PoolTimeout => {
+                    tracing::trace!("Waiting for a database connection to become available");
+                    tokio::time::sleep(sleep).await;
+                }
+                DbInterruption::Permanent => {
+                    return Err(db_error!("wait for reconnection")(error));
+                }
+            },
         }
     }
 }
@@ -95,8 +118,8 @@ pub(crate) use db_error;
 #[cfg(test)]
 mod tests {
     use super::{
-        is_connection_error, is_pool_timeout, is_retryable_database_error, ordinal,
-        std_duration_to_chrono, wait_for_reconnection,
+        db_interruption, is_connection_error, is_pool_timeout, is_retryable_database_error,
+        ordinal, std_duration_to_chrono, wait_for_reconnection, DbInterruption,
     };
     use chrono::Duration as ChronoDuration;
     use sqlx::{
@@ -139,6 +162,27 @@ mod tests {
     #[test]
     fn pool_timeouts_are_detected_separately() {
         assert!(is_pool_timeout(&sqlx::Error::PoolTimedOut));
+    }
+
+    #[test]
+    fn db_interruption_classifies_retryable_errors() {
+        assert_eq!(
+            db_interruption(&sqlx::Error::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection dropped",
+            ))),
+            DbInterruption::Connection,
+        );
+        assert_eq!(
+            db_interruption(&sqlx::Error::PoolTimedOut),
+            DbInterruption::PoolTimeout,
+        );
+        assert_eq!(
+            db_interruption(&sqlx::Error::Tls(
+                io::Error::other("bad certificate").into(),
+            )),
+            DbInterruption::Permanent,
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{
     listener::Listener,
     task::{Task, WorkerLease},
-    util::{db_error, is_connection_error, is_pool_timeout, wait_for_reconnection},
+    util::{db_error, db_interruption, wait_for_reconnection, DbInterruption},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
 use parking_lot::Mutex;
@@ -348,24 +348,31 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     async fn handle_recv_task_error(&self, error: Error) -> Result<()> {
-        if matches!(&error, Error::Db(db_error, _) if is_connection_error(db_error)) {
-            warn!(
-                "Task fetching stopped because the database connection was interrupted:\n{}",
-                source_chain::to_string(&error)
-            );
-            sleep(LOST_CONNECTION_SLEEP).await;
-            wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await?;
-            warn!("Task fetching resumed");
-            Ok(())
-        } else if matches!(&error, Error::Db(db_error, _) if is_pool_timeout(db_error)) {
-            warn!(
-                "Task fetching is waiting for a free database connection from the pool:\n{}",
-                source_chain::to_string(&error)
-            );
-            sleep(LOST_CONNECTION_SLEEP).await;
-            Ok(())
-        } else {
-            Err(error)
+        let interruption = match &error {
+            Error::Db(db_error, _) => db_interruption(db_error),
+            _ => DbInterruption::Permanent,
+        };
+
+        match interruption {
+            DbInterruption::Connection => {
+                warn!(
+                    "Task fetching stopped because the database connection was interrupted:\n{}",
+                    source_chain::to_string(&error)
+                );
+                sleep(LOST_CONNECTION_SLEEP).await;
+                wait_for_reconnection(&self.db, LOST_CONNECTION_SLEEP).await?;
+                warn!("Task fetching resumed");
+                Ok(())
+            }
+            DbInterruption::PoolTimeout => {
+                warn!(
+                    "Task fetching is waiting for a free database connection from the pool:\n{}",
+                    source_chain::to_string(&error)
+                );
+                sleep(LOST_CONNECTION_SLEEP).await;
+                Ok(())
+            }
+            DbInterruption::Permanent => Err(error),
         }
     }
 

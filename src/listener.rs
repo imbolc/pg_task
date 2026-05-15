@@ -154,39 +154,43 @@ impl Listener {
         db: &PgPool,
         error: sqlx::Error,
     ) -> bool {
-        if util::is_connection_error(&error) {
-            warn!(
-                "Listening for task table changes stopped because the database connection was interrupted:\n{}",
-                source_chain::to_string(&error)
-            );
-            sleep(LOST_CONNECTION_SLEEP).await;
-            if let Err(error) = util::wait_for_reconnection(db, LOST_CONNECTION_SLEEP).await {
+        match util::db_interruption(&error) {
+            util::DbInterruption::Connection => {
                 warn!(
-                    "Couldn't wait for the database to recover after listener failure:\n{}",
+                    "Listening for task table changes stopped because the database connection was interrupted:\n{}",
                     source_chain::to_string(&error)
                 );
-                Self::set_error(error_slot, error);
-                notify.notify_one();
-                true
-            } else {
-                warn!("Listening for task table changes resumed");
+                sleep(LOST_CONNECTION_SLEEP).await;
+                if let Err(error) = util::wait_for_reconnection(db, LOST_CONNECTION_SLEEP).await {
+                    warn!(
+                        "Couldn't wait for the database to recover after listener failure:\n{}",
+                        source_chain::to_string(&error)
+                    );
+                    Self::set_error(error_slot, error);
+                    notify.notify_one();
+                    true
+                } else {
+                    warn!("Listening for task table changes resumed");
+                    false
+                }
+            }
+            util::DbInterruption::PoolTimeout => {
+                warn!(
+                    "Listening for task table changes is waiting for a free database connection from the pool:\n{}",
+                    source_chain::to_string(&error)
+                );
+                sleep(LOST_CONNECTION_SLEEP).await;
                 false
             }
-        } else if util::is_pool_timeout(&error) {
-            warn!(
-                "Listening for task table changes is waiting for a free database connection from the pool:\n{}",
-                source_chain::to_string(&error)
-            );
-            sleep(LOST_CONNECTION_SLEEP).await;
-            false
-        } else {
-            warn!(
-                "Listening for task table changes failed:\n{}",
-                source_chain::to_string(&error)
-            );
-            Self::set_error(error_slot, crate::Error::ListenerReceive(error));
-            notify.notify_one();
-            true
+            util::DbInterruption::Permanent => {
+                warn!(
+                    "Listening for task table changes failed:\n{}",
+                    source_chain::to_string(&error)
+                );
+                Self::set_error(error_slot, crate::Error::ListenerReceive(error));
+                notify.notify_one();
+                true
+            }
         }
     }
 
