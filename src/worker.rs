@@ -4,11 +4,12 @@ use crate::{
     util::{db_error, is_connection_error, is_pool_timeout, wait_for_reconnection},
     Error, Result, Step, LOST_CONNECTION_SLEEP,
 };
+use parking_lot::Mutex;
 use sqlx::postgres::PgPool;
 use std::{
     marker::PhantomData,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -452,9 +453,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         task_id: Uuid,
         abort_handle: tokio::task::AbortHandle,
     ) {
-        let mut running_steps = running_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running_steps = running_steps.lock();
         running_steps.retain(|step| !step.abort_handle.is_finished());
         running_steps.push(RunningStep {
             task_id,
@@ -463,9 +462,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     fn abort_running_steps(running_steps: &Mutex<Vec<RunningStep>>) {
-        let running_steps = running_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running_steps = running_steps.lock();
         for step in &*running_steps {
             step.abort_handle.abort();
         }
@@ -477,9 +474,7 @@ impl<S: Step<S> + 'static> Worker<S> {
     }
 
     fn running_task_ids(running_steps: &Mutex<Vec<RunningStep>>) -> Vec<Uuid> {
-        let mut running_steps = running_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running_steps = running_steps.lock();
         running_steps.retain(|step| !step.abort_handle.is_finished());
         running_steps.iter().map(|step| step.task_id).collect()
     }
@@ -650,6 +645,7 @@ mod tests {
     };
     use crate::{task::TaskLease, Error, NextStep, Step};
     use chrono::{Duration as ChronoDuration, Utc};
+    use parking_lot::Mutex;
     use sqlx::{
         postgres::{PgConnectOptions, PgPoolOptions},
         PgPool,
@@ -660,7 +656,7 @@ mod tests {
         num::NonZeroUsize,
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc, Mutex, OnceLock,
+            Arc, OnceLock,
         },
         time::Duration,
     };
@@ -816,10 +812,7 @@ mod tests {
         }
 
         fn record(&self, event: &'static str) {
-            self.events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(event);
+            self.events.lock().push(event);
             self.events_changed.notify_waiters();
         }
 
@@ -828,22 +821,13 @@ mod tests {
         }
 
         fn events(&self) -> Vec<&'static str> {
-            self.events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            self.events.lock().clone()
         }
 
         async fn wait_for_events(&self, count: usize) {
             timeout(Duration::from_secs(1), async {
                 loop {
-                    if self
-                        .events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .len()
-                        >= count
-                    {
+                    if self.events.lock().len() >= count {
                         return;
                     }
                     self.events_changed.notified().await;
@@ -867,10 +851,7 @@ mod tests {
         fn new() -> Self {
             let key = NEXT_STEP_STATE_KEY.fetch_add(1, Ordering::Relaxed);
             let state = Arc::new(StepState::new());
-            step_states()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, state.clone());
+            step_states().lock().insert(key, state.clone());
             Self { key, state }
         }
 
@@ -885,10 +866,7 @@ mod tests {
 
     impl Drop for StepStateGuard {
         fn drop(&mut self) {
-            step_states()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&self.key);
+            step_states().lock().remove(&self.key);
         }
     }
 
@@ -900,12 +878,7 @@ mod tests {
     }
 
     fn step_state(key: u64) -> Arc<StepState> {
-        step_states()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned()
-            .unwrap()
+        step_states().lock().get(&key).cloned().unwrap()
     }
 
     fn connection_error() -> Error {
@@ -1517,13 +1490,7 @@ mod tests {
 
         Worker::<TestTask>::track_running_step(&running_steps, Uuid::new_v4(), running_step_abort);
 
-        assert_eq!(
-            running_steps
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-        );
+        assert_eq!(running_steps.lock().len(), 1);
         assert!(Worker::<TestTask>::has_running_steps(&running_steps));
 
         Worker::<TestTask>::abort_running_steps(&running_steps);

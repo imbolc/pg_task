@@ -1,9 +1,10 @@
 use crate::{util, LOST_CONNECTION_SLEEP};
+use parking_lot::Mutex;
 use sqlx::{postgres::PgListener, PgPool};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -103,10 +104,7 @@ impl Listener {
     }
 
     pub(crate) fn take_error(&self) -> Option<crate::Error> {
-        self.error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        self.error.lock().take()
     }
 
     pub(crate) fn shutdown(&self) {
@@ -114,30 +112,22 @@ impl Listener {
     }
 
     fn set_error(error_slot: &Mutex<Option<crate::Error>>, error: crate::Error) {
-        *error_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        *error_slot.lock() = Some(error);
     }
 
     fn replace_task(
         task_slot: &Mutex<Option<tokio::task::AbortHandle>>,
         task: tokio::task::AbortHandle,
     ) {
-        if let Some(old_task) = task_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(task)
-        {
+        let old_task = task_slot.lock().replace(task);
+        if let Some(old_task) = old_task {
             old_task.abort();
         }
     }
 
     fn clear_task(task_slot: &Mutex<Option<tokio::task::AbortHandle>>) {
-        if let Some(task) = task_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        let task = task_slot.lock().take();
+        if let Some(task) = task {
             task.abort();
         }
     }
@@ -255,8 +245,9 @@ mod tests {
     use super::Listener;
     use crate::Error;
     use chrono::{DateTime, Utc};
+    use parking_lot::Mutex;
     use sqlx::{postgres::PgPoolOptions, types::Uuid, PgPool};
-    use std::{future::pending, io, sync::Mutex, time::Duration};
+    use std::{future::pending, io, time::Duration};
     use tokio::{
         sync::Notify,
         time::{sleep, timeout},
@@ -385,10 +376,7 @@ mod tests {
             !Listener::handle_recv_error(&error_slot, &notify, &db, sqlx::Error::PoolTimedOut)
                 .await
         );
-        assert!(error_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none());
+        assert!(error_slot.lock().is_none());
     }
 
     #[tokio::test]
@@ -415,10 +403,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            error_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
+            error_slot.lock().take(),
             Some(Error::ListenerReceive(sqlx::Error::Protocol(_)))
         ));
     }
@@ -436,10 +421,7 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), subscription)
             .await
             .is_err());
-        assert!(error_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none());
+        assert!(error_slot.lock().is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -460,10 +442,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            error_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
+            error_slot.lock().take(),
             Some(Error::Db(sqlx::Error::Database(_), _))
         ));
     }
@@ -663,12 +642,7 @@ mod tests {
 
         timeout(Duration::from_secs(1), async {
             loop {
-                if listener
-                    .error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some()
-                {
+                if listener.error.lock().is_some() {
                     return;
                 }
                 sleep(Duration::from_millis(10)).await;
