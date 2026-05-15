@@ -27,16 +27,19 @@ pub(crate) struct TaskLease {
 
 impl TaskLease {
     pub(crate) fn new(worker_id: Uuid, timeout: Duration) -> Self {
-        let microseconds = timeout.as_nanos().saturating_add(999) / 1_000;
-        let microseconds = microseconds.min(i64::MAX as u128) as i64;
         Self {
             worker_id,
-            timeout: PgInterval {
-                months: 0,
-                days: 0,
-                microseconds,
-            },
+            timeout: duration_to_pg_interval(timeout),
         }
+    }
+}
+
+fn duration_to_pg_interval(duration: Duration) -> PgInterval {
+    let microseconds = duration.as_nanos().div_ceil(1_000);
+    PgInterval {
+        months: 0,
+        days: 0,
+        microseconds: microseconds.min(i64::MAX as u128) as i64,
     }
 }
 
@@ -601,6 +604,24 @@ mod tests {
 
     fn task_lease() -> TaskLease {
         TaskLease::new(worker_id(), Duration::from_secs(60))
+    }
+
+    #[test]
+    fn task_lease_converts_timeout_to_microsecond_interval() {
+        let lease = TaskLease::new(worker_id(), Duration::from_micros(42));
+        assert_eq!(lease.timeout.microseconds, 42);
+    }
+
+    #[test]
+    fn task_lease_rounds_timeout_up_to_microseconds() {
+        let lease = TaskLease::new(worker_id(), Duration::from_nanos(1));
+        assert_eq!(lease.timeout.microseconds, 1);
+    }
+
+    #[test]
+    fn task_lease_saturates_large_timeouts() {
+        let lease = TaskLease::new(worker_id(), Duration::MAX);
+        assert_eq!(lease.timeout.microseconds, i64::MAX);
     }
 
     async fn insert_task_row(
