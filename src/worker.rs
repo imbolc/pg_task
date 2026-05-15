@@ -265,7 +265,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         }
     }
 
-    /// Claims a currently available task and marks it running.
+    /// Claims a currently available task lease.
     async fn claim_available_task(
         &self,
         lease: WorkerLease,
@@ -286,7 +286,7 @@ impl<S: Step<S> + 'static> Worker<S> {
         Ok(Some((task, step, lease)))
     }
 
-    /// Waits until the next task is ready, marks it running and returns it.
+    /// Waits until the next task is ready, claims its lease and returns it.
     /// Returns `None` if the worker is stopped
     #[cfg(test)]
     async fn recv_task(&self, lease: WorkerLease) -> Result<Option<(Task, S, WorkerLease)>> {

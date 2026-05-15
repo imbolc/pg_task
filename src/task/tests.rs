@@ -399,7 +399,7 @@ async fn fetch_ready_returns_db_errors_for_query_failures(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn mark_running_returns_db_errors_for_update_failures(pool: PgPool) {
+async fn claim_lease_returns_db_errors_for_update_failures(pool: PgPool) {
     let id = insert_task(&pool, &TestTask::Valid(Valid), 0, false).await;
     let task = task_with_step(id, &TestTask::Valid(Valid), 0);
     sqlx::query!("ALTER TABLE pg_task RENAME COLUMN locked_by TO task_locked_by")
@@ -408,10 +408,7 @@ async fn mark_running_returns_db_errors_for_update_failures(pool: PgPool) {
         .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let err = task
-        .mark_running(&mut tx, worker_lease())
-        .await
-        .unwrap_err();
+    let err = task.claim_lease(&mut tx, worker_lease()).await.unwrap_err();
 
     assert_database_error(err);
 }

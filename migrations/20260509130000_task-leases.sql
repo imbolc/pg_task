@@ -28,7 +28,9 @@ ON pg_task ((
 ))
 WHERE error IS NULL;
 
--- Remove `running_at` column
+DROP INDEX pg_task_wakeup_at_idx;
+
+-- Remove `is_running` column
 UPDATE pg_task
 SET locked_by = gen_random_uuid(),
     lock_expires_at = now()

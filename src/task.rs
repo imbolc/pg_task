@@ -111,13 +111,13 @@ impl Task {
         .map_err(db_error!())
     }
 
-    /// Marks the task running
-    pub(crate) async fn mark_running(
+    /// Claims the task lease for this worker.
+    pub(crate) async fn claim_lease(
         &self,
         con: &mut PgConnection,
         lease: WorkerLease,
     ) -> Result<()> {
-        trace!("[{}] mark running", self.id);
+        trace!("[{}] claim lease", self.id);
         sqlx::query!(
             r#"
             UPDATE pg_task
@@ -131,7 +131,7 @@ impl Task {
         )
         .execute(con)
         .await
-        .map_err(db_error!())?;
+        .map_err(db_error!("claim lease"))?;
         Ok(())
     }
 
@@ -165,9 +165,9 @@ impl Task {
         .map_err(db_error!("renew leases"))
     }
 
-    /// Deserializes the current task step and marks it running.
+    /// Deserializes the current task step and claims its lease.
     /// If deserialization fails, stores the error instead and leaves the task
-    /// non-running.
+    /// unleased.
     pub(crate) async fn claim<S: Step<S>>(
         &self,
         con: &mut PgConnection,
@@ -181,7 +181,7 @@ impl Task {
             }
         };
 
-        self.mark_running(con, lease).await?;
+        self.claim_lease(con, lease).await?;
         Ok(Some(step))
     }
 
@@ -210,7 +210,7 @@ impl Task {
                     self.retry(db, self.tried, retry_limit, retry_delay, e, lease)
                         .await?;
                 } else {
-                    self.save_step_error(db, e, true, lease).await?;
+                    self.save_step_error(db, e, lease).await?;
                 }
             }
             Ok(NextStep::None) => self.complete(db, lease).await?,
@@ -262,31 +262,23 @@ impl Task {
     }
 
     /// Saves the task error if the worker still owns the task.
-    async fn save_step_error(
-        &self,
-        db: &PgPool,
-        err: StepError,
-        increment_tried: bool,
-        lease: WorkerLease,
-    ) -> Result<()> {
+    async fn save_step_error(&self, db: &PgPool, err: StepError, lease: WorkerLease) -> Result<()> {
         let err_str = source_chain::to_string(&*err);
-        let tried_increment = if increment_tried { 1 } else { 0 };
         let updated_task = sqlx::query!(
             r#"
             UPDATE pg_task
-            SET tried = tried + $3,
+            SET tried = tried + 1,
                 error = $2,
                 wakeup_at = now(),
                 locked_by = NULL,
                 lock_expires_at = NULL
             WHERE id = $1
-              AND locked_by = $4
+              AND locked_by = $3
               AND lock_expires_at > now()
             RETURNING step::TEXT as "step!"
             "#,
             self.id,
             &err_str,
-            tried_increment,
             lease.worker_id,
         )
         .fetch_optional(db)
@@ -298,21 +290,13 @@ impl Task {
             return Ok(());
         };
 
-        if increment_tried {
-            let attempt = self.tried + 1;
-            error!(
-                "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
-                id = self.id,
-                step = updated_task.step,
-                attempt = ordinal(attempt)
-            );
-        } else {
-            error!(
-                "[{id}] couldn't deserialize step {step}: {err_str}",
-                id = self.id,
-                step = updated_task.step
-            );
-        }
+        let attempt = self.tried + 1;
+        error!(
+            "[{id}] resulted in an error at step {step} on {attempt} attempt: {err_str}",
+            id = self.id,
+            step = updated_task.step,
+            attempt = ordinal(attempt)
+        );
 
         Ok(())
     }
@@ -329,7 +313,7 @@ impl Task {
             .map_err(|e| Error::SerializeStep(e, format!("{step:?}")))
         {
             Ok(x) => x,
-            Err(e) => return self.save_step_error(db, e.into(), true, lease).await,
+            Err(e) => return self.save_step_error(db, e.into(), lease).await,
         };
         let result = sqlx::query!(
             "
