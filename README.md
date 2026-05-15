@@ -6,6 +6,10 @@
 
 FSM-based resumable Postgres tasks.
 
+pg_task stores task state in Postgres and runs each task as a resumable state
+machine, with scheduling, retries, delays, errors, and worker leases handled by
+a single table.
+
 The full crate documentation, tutorial, and API examples live on
 [docs.rs/pg_task][docs]
 
