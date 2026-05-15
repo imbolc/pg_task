@@ -1885,7 +1885,7 @@ mod tests {
             async move {
                 Worker::<TestTask>::new(pool)
                     .with_concurrency(nonzero(1))
-                    .with_lease_timeout(Duration::from_millis(200))
+                    .with_lease_timeout(Duration::from_secs(1))
                     .with_heartbeat_interval(Duration::from_millis(50))
                     .run()
                     .await
@@ -1895,11 +1895,18 @@ mod tests {
         state.state().wait_for_events(1).await;
         let (locked_by, initial_expires_at) = fetch_task_lease(&pool, id).await.unwrap();
 
-        sleep(Duration::from_millis(350)).await;
-
-        let (renewed_by, renewed_expires_at) = fetch_task_lease(&pool, id).await.unwrap();
+        let (renewed_by, renewed_expires_at) = timeout(Duration::from_secs(1), async {
+            loop {
+                let (renewed_by, renewed_expires_at) = fetch_task_lease(&pool, id).await.unwrap();
+                if renewed_expires_at > initial_expires_at {
+                    return (renewed_by, renewed_expires_at);
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(renewed_by, locked_by);
-        assert!(renewed_expires_at > initial_expires_at);
         assert!(renewed_expires_at > Utc::now());
 
         stop_worker(&pool).await;
